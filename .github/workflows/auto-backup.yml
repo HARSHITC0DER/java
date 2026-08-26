@@ -9,15 +9,20 @@ name: Automatic Private Repository Backup
 
 jobs:
   backup:
+    # IMPORTANT:
+    # Only the original repository can create backups.
+    # Backup repositories will NOT run this job.
+    if: github.repository == 'HARSHITC0DER/java'
+
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout source repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 1
 
-      - name: Create private backup and copy current files
+      - name: Create private backup repository
         env:
           GH_TOKEN: ${{ secrets.BACKUP_TOKEN }}
           SOURCE_REPO: ${{ github.repository }}
@@ -40,7 +45,7 @@ jobs:
           echo "Commit            : $COMMIT_SHA"
           echo "========================================"
 
-          # Verify the token belongs to ARJUNC0DER
+          # Verify the token account
           LOGIN=$(gh api user --jq '.login')
 
           echo "Authenticated account: $LOGIN"
@@ -51,10 +56,10 @@ jobs:
             exit 1
           fi
 
-          # Create a NEW PRIVATE repository
+          # Create a new PRIVATE repository
           gh repo create "$OWNER/$BACKUP_REPO" \
             --private \
-            --description "Automatic private backup of $REPO at commit $COMMIT_SHA"
+            --description "Private automatic backup of $REPO at commit $COMMIT_SHA"
 
           echo "Private backup repository created."
 
@@ -62,21 +67,19 @@ jobs:
           gh api "repos/${OWNER}/${BACKUP_REPO}" \
             --jq '"Repository confirmed: " + .full_name + " | Private: " + (.private | tostring)'
 
-          # Configure GitHub API authentication
-          export GH_TOKEN="$GH_TOKEN"
-
-          # Create a temporary directory containing the source files.
-          # Exclude the .git directory because the backup is created as a
-          # fresh repository.
+          # Create temporary directory
           TEMP_DIR="$(mktemp -d)"
 
+          # Copy source files without the Git history
+          # The workflow itself will be copied, but the condition above
+          # prevents it from running inside the backup repository.
           rsync -a \
             --exclude='.git/' \
             ./ "$TEMP_DIR/"
 
           cd "$TEMP_DIR"
 
-          # Initialize a fresh Git repository for the backup.
+          # Create a fresh Git repository
           git init
           git checkout -b main
 
@@ -88,7 +91,7 @@ jobs:
           git commit \
             -m "Automatic backup of ${REPO} at ${COMMIT_SHA}"
 
-          # Configure authenticated Git remote using the same token.
+          # Authenticate Git using the backup token
           git remote add origin \
             "https://x-access-token:${GH_TOKEN}@github.com/${OWNER}/${BACKUP_REPO}.git"
 
