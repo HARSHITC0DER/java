@@ -1,10 +1,11 @@
 
-name: Automatic Repository Backup
+name: Automatic Private Repository Backup
 
 "on":
   push:
     branches:
       - main
+
   workflow_dispatch:
 
 jobs:
@@ -12,12 +13,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout source repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 1
 
-      - name: Create private backup repository
+      - name: Create private backup and copy current files
         env:
           GH_TOKEN: ${{ secrets.BACKUP_TOKEN }}
           SOURCE_REPO: ${{ github.repository }}
@@ -42,44 +43,59 @@ jobs:
 
           # Verify the token belongs to ARJUNC0DER
           LOGIN=$(gh api user --jq '.login')
+
           echo "Authenticated account: $LOGIN"
 
           if [ "$LOGIN" != "$OWNER" ]; then
             echo "ERROR: BACKUP_TOKEN belongs to $LOGIN"
-            echo "Expected: $OWNER"
+            echo "Expected account: $OWNER"
             exit 1
           fi
 
           # Create a NEW PRIVATE repository
           gh repo create "$OWNER/$BACKUP_REPO" \
             --private \
-            --description "Private automatic backup of $REPO at commit $COMMIT_SHA"
+            --description "Automatic private backup of $REPO at commit $COMMIT_SHA"
 
           echo "Private backup repository created."
 
-          # Verify that GitHub can access the newly created repository
-          echo "Verifying backup repository..."
-
+          # Verify repository
           gh api "repos/${OWNER}/${BACKUP_REPO}" \
             --jq '"Repository confirmed: " + .full_name + " | Private: " + (.private | tostring)'
 
-          # Create a temporary authentication header.
-          # The token is never written into the repository.
-          AUTH_HEADER=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w 0)
+          # Configure GitHub API authentication
+          export GH_TOKEN="$GH_TOKEN"
 
-          # Add the newly created repository as a remote.
-          git remote add backup \
-            "https://github.com/${OWNER}/${BACKUP_REPO}.git"
+          # Create a temporary directory containing the source files.
+          # Exclude the .git directory because the backup is created as a
+          # fresh repository.
+          TEMP_DIR="$(mktemp -d)"
 
-          echo "Pushing all branches..."
+          rsync -a \
+            --exclude='.git/' \
+            ./ "$TEMP_DIR/"
 
-          git -c "http.extraheader=AUTHORIZATION: basic ${AUTH_HEADER}" \
-            push backup --all
+          cd "$TEMP_DIR"
 
-          echo "Pushing all tags..."
+          # Initialize a fresh Git repository for the backup.
+          git init
+          git checkout -b main
 
-          git -c "http.extraheader=AUTHORIZATION: basic ${AUTH_HEADER}" \
-            push backup --tags
+          git config user.name "ARJUNC0DER Backup"
+          git config user.email "ARJUNC0DER@users.noreply.github.com"
+
+          git add -A
+
+          git commit \
+            -m "Automatic backup of ${REPO} at ${COMMIT_SHA}"
+
+          # Configure authenticated Git remote using the same token.
+          git remote add origin \
+            "https://x-access-token:${GH_TOKEN}@github.com/${OWNER}/${BACKUP_REPO}.git"
+
+          echo "Pushing backup..."
+
+          git push -u origin main
 
           echo "========================================"
           echo "BACKUP SUCCESSFUL"
