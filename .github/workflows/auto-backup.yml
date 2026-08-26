@@ -1,11 +1,10 @@
 ```yaml
 name: Automatic Repository Backup
 
-on:
+"on":
   push:
     branches:
       - main
-
   workflow_dispatch:
 
 jobs:
@@ -24,44 +23,26 @@ jobs:
           SOURCE_REPO: ${{ github.repository }}
           COMMIT_SHA: ${{ github.sha }}
         run: |
-          # GitHub account where backups will be created
           OWNER="ARJUNC0DER"
-
-          # Get original repository name
-          REPO=$(echo "$SOURCE_REPO" | cut -d/ -f2)
-
-          # Create unique timestamp
+          REPO="${SOURCE_REPO#*/}"
           TIMESTAMP=$(date -u +"%Y%m%d-%H%M%S")
-
-          # Create unique backup repository name
           BACKUP_REPO="${REPO}-backup-${TIMESTAMP}"
 
-          echo "======================================"
-          echo "Automatic Repository Backup"
-          echo "======================================"
-          echo "Source repository : $SOURCE_REPO"
-          echo "Backup owner      : $OWNER"
-          echo "Backup repository : $BACKUP_REPO"
-          echo "Commit            : $COMMIT_SHA"
-          echo "======================================"
+          echo "Source repository: $SOURCE_REPO"
+          echo "Backup owner: $OWNER"
+          echo "Backup repository: $BACKUP_REPO"
+          echo "Commit: $COMMIT_SHA"
 
-          # Create a new private repository under ARJUNC0DER
           gh repo create "$OWNER/$BACKUP_REPO" \
             --private \
             --description "Automatic backup of $REPO at commit $COMMIT_SHA"
 
-          # Add backup repository as Git remote
           git remote add backup \
             "https://x-access-token:${GH_TOKEN}@github.com/${OWNER}/${BACKUP_REPO}.git"
 
-          # Push all branches
           git push backup --all
-
-          # Push all tags
           git push backup --tags
 
-          echo "======================================"
-          echo "Backup created successfully"
+          echo "Backup created successfully:"
           echo "https://github.com/${OWNER}/${BACKUP_REPO}"
-          echo "======================================"
 ```
