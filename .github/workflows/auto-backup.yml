@@ -1,4 +1,4 @@
-```yaml
+
 name: Automatic Repository Backup
 
 "on":
@@ -45,4 +45,4 @@ jobs:
 
           echo "Backup created successfully:"
           echo "https://github.com/${OWNER}/${BACKUP_REPO}"
-```
+
