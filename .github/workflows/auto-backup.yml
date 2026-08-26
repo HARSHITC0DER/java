@@ -1,11 +1,9 @@
-
 name: Automatic Repository Backup
 
 "on":
   push:
     branches:
       - main
-
   workflow_dispatch:
 
 jobs:
@@ -26,16 +24,10 @@ jobs:
         run: |
           set -e
 
-          # GitHub account where backups will be created
           OWNER="ARJUNC0DER"
-
-          # Get original repository name
           REPO="${SOURCE_REPO#*/}"
 
-          # Create unique timestamp
           TIMESTAMP=$(date -u +"%Y%m%d-%H%M%S")
-
-          # Create unique backup repository name
           BACKUP_REPO="${REPO}-backup-${TIMESTAMP}"
 
           echo "======================================"
@@ -47,29 +39,41 @@ jobs:
           echo "Commit            : $COMMIT_SHA"
           echo "======================================"
 
-          # Verify the token can access the ARJUNC0DER account
-          gh api user --jq '.login'
+          # Confirm which GitHub account owns the token
+          LOGIN=$(gh api user --jq '.login')
+          echo "Authenticated GitHub account: $LOGIN"
 
-          # Create a new private repository under ARJUNC0DER
+          if [ "$LOGIN" != "$OWNER" ]; then
+            echo "ERROR: BACKUP_TOKEN belongs to $LOGIN, not $OWNER."
+            exit 1
+          fi
+
+          # Create a new private backup repository
           gh repo create "$OWNER/$BACKUP_REPO" \
             --private \
             --description "Automatic backup of $REPO at commit $COMMIT_SHA"
 
-          # Configure Git authentication through GitHub CLI
-          gh auth setup-git
+          echo "Backup repository created."
 
-          # Add the new backup repository as a remote
+          # Configure Git to authenticate every github.com HTTPS request
+          git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
+
+          # Add the newly created repository
           git remote add backup \
             "https://github.com/${OWNER}/${BACKUP_REPO}.git"
 
+          echo "Pushing all branches..."
+
           # Push all branches
           git push backup --all
+
+          echo "Pushing all tags..."
 
           # Push all tags
           git push backup --tags
 
           echo "======================================"
-          echo "Backup created successfully"
+          echo "BACKUP SUCCESSFUL"
           echo "======================================"
           echo "Backup repository:"
           echo "https://github.com/${OWNER}/${BACKUP_REPO}"
