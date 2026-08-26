@@ -9,31 +9,21 @@ name: Full Private Git History Backup
 
 jobs:
   backup:
-    # IMPORTANT:
-    # Only the original repository creates backups.
-    # Backup repositories will never create another backup.
+    # Only the original repository can create backups.
     if: github.repository == 'HARSHITC0DER/java'
 
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout complete Git history
+      - name: Checkout complete Git repository
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
           fetch-tags: true
 
-      - name: Generate GitHub App token
-        id: app-token
-        uses: actions/create-github-app-token@v2
-        with:
-          app-id: ${{ secrets.APP_ID }}
-          private-key: ${{ secrets.APP_PRIVATE_KEY }}
-          owner: ARJUNC0DER
-
-      - name: Create private full-history backup
+      - name: Create full private backup
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_TOKEN: ${{ secrets.BACKUP_TOKEN }}
           SOURCE_REPO: ${{ github.repository }}
           COMMIT_SHA: ${{ github.sha }}
         run: |
@@ -54,22 +44,29 @@ jobs:
           echo "Commit            : $COMMIT_SHA"
           echo "========================================"
 
-          # Verify App identity
-          LOGIN=$(gh api user --jq '.login' 2>/dev/null || true)
-          echo "Authenticated identity: $LOGIN"
+          # Verify PAT identity
+          LOGIN=$(gh api user --jq '.login')
 
-          # Create a NEW PRIVATE repository
+          echo "Authenticated account: $LOGIN"
+
+          if [ "$LOGIN" != "$OWNER" ]; then
+            echo "ERROR: BACKUP_TOKEN belongs to $LOGIN"
+            echo "Expected: $OWNER"
+            exit 1
+          fi
+
+          # Create NEW PRIVATE repository
           gh repo create "$OWNER/$BACKUP_REPO" \
             --private \
-            --description "Complete Git history backup of $REPO at commit $COMMIT_SHA"
+            --description "Complete private Git backup of $REPO at $COMMIT_SHA"
 
           echo "Private backup repository created."
 
-          # Verify repository exists and is private
+          # Verify that the repository exists and is private
           gh api "repos/${OWNER}/${BACKUP_REPO}" \
             --jq '"Repository confirmed: " + .full_name + " | Private: " + (.private | tostring)'
 
-          # Configure Git to authenticate using the GitHub App token
+          # Configure Git authentication
           git config --global \
             url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf \
             "https://github.com/"
@@ -82,25 +79,21 @@ jobs:
             "https://github.com/${OWNER}/${BACKUP_REPO}.git"
 
           echo "========================================"
-          echo "Pushing ALL branches..."
+          echo "Pushing COMPLETE Git history..."
           echo "========================================"
 
-          git push backup --all
-
-          echo "========================================"
-          echo "Pushing ALL tags..."
-          echo "========================================"
-
-          git push backup --tags
+          # Mirror ALL refs:
+          # - all branches
+          # - all tags
+          # - complete commit history
+          git push backup --mirror
 
           echo "========================================"
           echo "BACKUP SUCCESSFUL"
           echo "========================================"
-          echo "Git history : COMPLETE"
-          echo "Branches    : ALL"
-          echo "Tags        : ALL"
-          echo "Visibility  : PRIVATE"
+          echo "Repository : ${OWNER}/${BACKUP_REPO}"
+          echo "Private    : YES"
+          echo "Commits    : ALL"
+          echo "Branches   : ALL"
+          echo "Tags       : ALL"
           echo "========================================"
-
-          echo "Backup repository:"
-          echo "https://github.com/${OWNER}/${BACKUP_REPO}"
