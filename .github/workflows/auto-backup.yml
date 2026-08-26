@@ -6,6 +6,8 @@ on:
     branches:
       - main
 
+  workflow_dispatch:
+
 jobs:
   backup:
     runs-on: ubuntu-latest
@@ -22,29 +24,33 @@ jobs:
           SOURCE_REPO: ${{ github.repository }}
           COMMIT_SHA: ${{ github.sha }}
         run: |
-          # Backup repositories will be created under ARJUNC0DER
+          # GitHub account where backups will be created
           OWNER="ARJUNC0DER"
 
-          # Get the original repository name
+          # Get original repository name
           REPO=$(echo "$SOURCE_REPO" | cut -d/ -f2)
 
-          # Create a unique timestamp for every backup
+          # Create unique timestamp
           TIMESTAMP=$(date -u +"%Y%m%d-%H%M%S")
 
-          # Backup repository name
+          # Create unique backup repository name
           BACKUP_REPO="${REPO}-backup-${TIMESTAMP}"
 
-          echo "Source repository: $SOURCE_REPO"
-          echo "Backup owner: $OWNER"
-          echo "Backup repository: $BACKUP_REPO"
-          echo "Commit: $COMMIT_SHA"
+          echo "======================================"
+          echo "Automatic Repository Backup"
+          echo "======================================"
+          echo "Source repository : $SOURCE_REPO"
+          echo "Backup owner      : $OWNER"
+          echo "Backup repository : $BACKUP_REPO"
+          echo "Commit            : $COMMIT_SHA"
+          echo "======================================"
 
           # Create a new private repository under ARJUNC0DER
           gh repo create "$OWNER/$BACKUP_REPO" \
             --private \
             --description "Automatic backup of $REPO at commit $COMMIT_SHA"
 
-          # Add the new backup repository as a Git remote
+          # Add backup repository as Git remote
           git remote add backup \
             "https://x-access-token:${GH_TOKEN}@github.com/${OWNER}/${BACKUP_REPO}.git"
 
@@ -54,7 +60,8 @@ jobs:
           # Push all tags
           git push backup --tags
 
-          echo "Backup created successfully."
-          echo "Backup repository:"
+          echo "======================================"
+          echo "Backup created successfully"
           echo "https://github.com/${OWNER}/${BACKUP_REPO}"
+          echo "======================================"
 ```
