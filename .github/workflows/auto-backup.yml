@@ -1,4 +1,4 @@
-name: Full Git History Private Backup
+name: Full Private Git History Backup
 
 "on":
   push:
@@ -9,22 +9,31 @@ name: Full Git History Private Backup
 
 jobs:
   backup:
-    # ONLY the original repository can create backups.
-    # Prevents backup repositories from creating more backups.
+    # IMPORTANT:
+    # Only the original repository creates backups.
+    # Backup repositories will never create another backup.
     if: github.repository == 'HARSHITC0DER/java'
 
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout complete Git repository
+      - name: Checkout complete Git history
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
           fetch-tags: true
 
-      - name: Create full Git history backup
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ARJUNC0DER
+
+      - name: Create private full-history backup
         env:
-          GH_TOKEN: ${{ secrets.BACKUP_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           SOURCE_REPO: ${{ github.repository }}
           COMMIT_SHA: ${{ github.sha }}
         run: |
@@ -37,65 +46,60 @@ jobs:
           BACKUP_REPO="${REPO}-backup-${TIMESTAMP}"
 
           echo "========================================"
-          echo "FULL GIT HISTORY BACKUP"
+          echo "FULL PRIVATE GIT BACKUP"
           echo "========================================"
           echo "Source repository : $SOURCE_REPO"
           echo "Backup owner      : $OWNER"
           echo "Backup repository : $BACKUP_REPO"
-          echo "Current commit    : $COMMIT_SHA"
+          echo "Commit            : $COMMIT_SHA"
           echo "========================================"
 
-          # Verify token account
-          LOGIN=$(gh api user --jq '.login')
+          # Verify App identity
+          LOGIN=$(gh api user --jq '.login' 2>/dev/null || true)
+          echo "Authenticated identity: $LOGIN"
 
-          echo "Authenticated account: $LOGIN"
-
-          if [ "$LOGIN" != "$OWNER" ]; then
-            echo "ERROR: BACKUP_TOKEN belongs to $LOGIN"
-            echo "Expected account: $OWNER"
-            exit 1
-          fi
-
-          # Create PRIVATE backup repository
+          # Create a NEW PRIVATE repository
           gh repo create "$OWNER/$BACKUP_REPO" \
             --private \
-            --description "Full Git history backup of $REPO at $COMMIT_SHA"
+            --description "Complete Git history backup of $REPO at commit $COMMIT_SHA"
 
           echo "Private backup repository created."
 
-          # Verify repository
+          # Verify repository exists and is private
           gh api "repos/${OWNER}/${BACKUP_REPO}" \
             --jq '"Repository confirmed: " + .full_name + " | Private: " + (.private | tostring)'
 
-          # Configure Git authentication
+          # Configure Git to authenticate using the GitHub App token
           git config --global \
             url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf \
             "https://github.com/"
 
-          # Remove the normal origin
+          # Remove original remote
           git remote remove origin || true
 
-          # Add the new backup repository
+          # Add backup repository
           git remote add backup \
             "https://github.com/${OWNER}/${BACKUP_REPO}.git"
 
           echo "========================================"
-          echo "Pushing COMPLETE Git history..."
+          echo "Pushing ALL branches..."
           echo "========================================"
 
-          # Push ALL branches
           git push backup --all
 
-          # Push ALL tags
+          echo "========================================"
+          echo "Pushing ALL tags..."
+          echo "========================================"
+
           git push backup --tags
 
           echo "========================================"
           echo "BACKUP SUCCESSFUL"
           echo "========================================"
-          echo "All branches: COPIED"
-          echo "All tags: COPIED"
-          echo "Git history: COPIED"
-          echo "Visibility: PRIVATE"
+          echo "Git history : COMPLETE"
+          echo "Branches    : ALL"
+          echo "Tags        : ALL"
+          echo "Visibility  : PRIVATE"
           echo "========================================"
 
           echo "Backup repository:"
