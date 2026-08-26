@@ -1,9 +1,11 @@
+
 name: Automatic Repository Backup
 
 "on":
   push:
     branches:
       - main
+
   workflow_dispatch:
 
 jobs:
@@ -16,7 +18,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Create backup repository
+      - name: Create private backup repository
         env:
           GH_TOKEN: ${{ secrets.BACKUP_TOKEN }}
           SOURCE_REPO: ${{ github.repository }}
@@ -24,47 +26,57 @@ jobs:
         run: |
           set -e
 
+          # Account where backups are created
           OWNER="ARJUNC0DER"
+
+          # Original repository name
           REPO="${SOURCE_REPO#*/}"
 
+          # Unique timestamp
           TIMESTAMP=$(date -u +"%Y%m%d-%H%M%S")
+
+          # Unique backup repository name
           BACKUP_REPO="${REPO}-backup-${TIMESTAMP}"
 
-          echo "======================================"
-          echo "Automatic Repository Backup"
-          echo "======================================"
+          echo "========================================"
+          echo "AUTOMATIC PRIVATE REPOSITORY BACKUP"
+          echo "========================================"
           echo "Source repository : $SOURCE_REPO"
           echo "Backup owner      : $OWNER"
           echo "Backup repository : $BACKUP_REPO"
           echo "Commit            : $COMMIT_SHA"
-          echo "======================================"
+          echo "========================================"
 
-          # Confirm which GitHub account owns the token
+          # Verify token account
           LOGIN=$(gh api user --jq '.login')
-          echo "Authenticated GitHub account: $LOGIN"
+
+          echo "Authenticated account: $LOGIN"
 
           if [ "$LOGIN" != "$OWNER" ]; then
-            echo "ERROR: BACKUP_TOKEN belongs to $LOGIN, not $OWNER."
+            echo "ERROR: BACKUP_TOKEN belongs to $LOGIN."
+            echo "Expected account: $OWNER"
             exit 1
           fi
 
-          # Create a new private backup repository
+          # Create a NEW PRIVATE repository
           gh repo create "$OWNER/$BACKUP_REPO" \
             --private \
-            --description "Automatic backup of $REPO at commit $COMMIT_SHA"
+            --description "Private automatic backup of $REPO at commit $COMMIT_SHA"
 
-          echo "Backup repository created."
+          echo "Private backup repository created."
 
-          # Configure Git to authenticate every github.com HTTPS request
-          git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
+          # Configure Git authentication using BACKUP_TOKEN
+          git config --global \
+            url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf \
+            "https://github.com/"
 
-          # Add the newly created repository
+          # Add the newly created backup repository
           git remote add backup \
             "https://github.com/${OWNER}/${BACKUP_REPO}.git"
 
           echo "Pushing all branches..."
 
-          # Push all branches
+          # Push complete branch history
           git push backup --all
 
           echo "Pushing all tags..."
@@ -72,9 +84,10 @@ jobs:
           # Push all tags
           git push backup --tags
 
-          echo "======================================"
+          echo "========================================"
           echo "BACKUP SUCCESSFUL"
-          echo "======================================"
-          echo "Backup repository:"
+          echo "========================================"
+          echo "Repository:"
           echo "https://github.com/${OWNER}/${BACKUP_REPO}"
-
+          echo "Visibility: PRIVATE"
+          echo "========================================"
