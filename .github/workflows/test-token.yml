@@ -1,4 +1,4 @@
-name: Test API Write
+name: Test Git Database API
 
 on:
   workflow_dispatch:
@@ -8,7 +8,13 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Test API write
+      - name: Checkout complete history
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Test Git Database API
         env:
           GH_TOKEN: ${{ secrets.BACKUP_TOKEN }}
         run: |
@@ -16,28 +22,22 @@ jobs:
 
           OWNER="ARJUNC0DER"
           TIMESTAMP=$(date -u +"%Y%m%d-%H%M%S")
-          REPO="api-write-test-${TIMESTAMP}"
+          REPO="git-api-test-${TIMESTAMP}"
 
           echo "Creating repository..."
+          gh repo create "$OWNER/$REPO" --private
 
-          gh repo create "$OWNER/$REPO" \
-            --private
+          echo "Repository: $OWNER/$REPO"
 
-          echo "Repository created."
+          echo "Creating test blob..."
 
-          echo "Testing Contents API..."
+          BLOB_SHA=$(gh api \
+            --method POST \
+            "repos/${OWNER}/${REPO}/git/blobs" \
+            -f content="Git Database API test" \
+            -f encoding="utf-8" \
+            --jq '.sha')
 
-          echo "hello from API test" > test.txt
+          echo "Blob created: $BLOB_SHA"
 
-          CONTENT=$(base64 -w 0 test.txt)
-
-          gh api \
-            --method PUT \
-            "repos/${OWNER}/${REPO}/contents/test.txt" \
-            -f message="Test API write" \
-            -f content="$CONTENT"
-
-          echo "SUCCESS: API can write to the repository."
-
-          echo "Repository:"
-          echo "https://github.com/${OWNER}/${REPO}"
+          echo "SUCCESS: Git Database API is working."
