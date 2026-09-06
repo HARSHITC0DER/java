@@ -1,4 +1,4 @@
-name: Test Git Push
+name: Test Create And Push
 
 on:
   workflow_dispatch:
@@ -14,20 +14,32 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
-      - name: Test push
+      - name: Create test repository and push
         env:
           GH_TOKEN: ${{ secrets.BACKUP_TOKEN }}
         run: |
           set -e
 
-          git config user.name "ARJUNC0DER"
-          git config user.email "ARJUNC0DER@users.noreply.github.com"
+          OWNER="ARJUNC0DER"
+          TIMESTAMP=$(date -u +"%Y%m%d-%H%M%S")
+          TEST_REPO="git-push-test-${TIMESTAMP}"
+
+          echo "Creating: ${OWNER}/${TEST_REPO}"
+
+          gh repo create "${OWNER}/${TEST_REPO}" \
+            --private \
+            --description "Temporary Git push authentication test"
+
+          echo "Repository created."
+
+          echo "Testing Git push..."
 
           git remote add backup \
-            "https://x-access-token:${GH_TOKEN}@github.com/ARJUNC0DER/java-backup-20260826-101339.git"
-
-          echo "Testing mirror push..."
+            "https://x-access-token:${GH_TOKEN}@github.com/${OWNER}/${TEST_REPO}.git"
 
           git push backup --mirror
 
-          echo "SUCCESS: Git mirror push completed."
+          echo "SUCCESS: Repository creation and Git push both work."
+
+          echo "Test repository:"
+          echo "https://github.com/${OWNER}/${TEST_REPO}"
