@@ -1,62 +1,490 @@
-name: Test Git Datadddbase API
+name: Full Private Git History Backup
 
 on:
+  push:
+    branches:
+      - main
+
   workflow_dispatch:
 
 jobs:
-  test:
+  backup:
+    # VERY IMPORTANT:
+    # Only the original repository can run this workflow.
+    # Backup repositories will never create another backup.
+    if: github.repository == 'HARSHITC0DER/java'
+
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout complete history
+      - name: Checkout complete repository
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
           fetch-tags: true
 
-      - name: Test Git Database API
+      - name: Create complete private backup
         env:
           GH_TOKEN: ${{ secrets.BACKUP_TOKEN }}
+          SOURCE_REPO: ${{ github.repository }}
+          SOURCE_SHA: ${{ github.sha }}
         run: |
-          set -e
+          set -euo pipefail
 
           OWNER="ARJUNC0DER"
+          SOURCE_NAME="${SOURCE_REPO#*/}"
+
           TIMESTAMP=$(date -u +"%Y%m%d-%H%M%S")
-          REPO="git-api-test-${TIMESTAMP}"
+          BACKUP_REPO="${SOURCE_NAME}-backup-${TIMESTAMP}"
 
-          echo "Creating repository..."
+          echo "========================================"
+          echo "FULL PRIVATE GIT BACKUP"
+          echo "========================================"
+          echo "Source repository : ${SOURCE_REPO}"
+          echo "Backup owner      : ${OWNER}"
+          echo "Backup repository : ${BACKUP_REPO}"
+          echo "Source commit     : ${SOURCE_SHA}"
+          echo "========================================"
 
-          gh repo create "$OWNER/$REPO" --private
+          echo
+          echo "Checking authentication..."
 
-          echo "Repository: $OWNER/$REPO"
+          LOGIN=$(gh api user --jq '.login')
 
-          echo "Creating initial file through Contents API..."
+          echo "Authenticated account: ${LOGIN}"
 
-          echo "Git Database API test" > test.txt
+          if [ "${LOGIN}" != "${OWNER}" ]; then
+            echo "ERROR: PAT belongs to ${LOGIN}, expected ${OWNER}"
+            exit 1
+          fi
 
-          CONTENT=$(base64 -w 0 test.txt)
+          echo
+          echo "Creating private backup repository..."
 
-          RESULT=$(gh api \
-            --method PUT \
-            "repos/${OWNER}/${REPO}/contents/test.txt" \
-            -f message="Initial commit" \
-            -f content="$CONTENT")
+          gh repo create "${OWNER}/${BACKUP_REPO}" \
+            --private \
+            --description "Complete Git history backup of ${SOURCE_REPO} at ${SOURCE_SHA}"
 
-          COMMIT_SHA=$(echo "$RESULT" | jq -r '.commit.sha')
+          echo
+          echo "Repository created:"
+          echo "https://github.com/${OWNER}/${BACKUP_REPO}"
 
-          echo "Initial commit created: $COMMIT_SHA"
+          gh api \
+            "repos/${OWNER}/${BACKUP_REPO}" \
+            --jq '"Repository confirmed: " + .full_name + " | Private: " + (.private | tostring)'
 
-          echo "Repository is no longer empty."
+          echo
+          echo "========================================"
+          echo "Preparing Git objects"
+          echo "========================================"
 
-          echo "Testing Git Database API..."
+          mkdir -p /tmp/git-backup
 
-          BLOB_SHA=$(gh api \
-            --method POST \
-            "repos/${OWNER}/${REPO}/git/blobs" \
-            -f content="Git Database API test" \
-            -f encoding="utf-8" \
-            --jq '.sha')
+          #
+          # Collect all reachable commits from every local branch.
+          #
+          git rev-list --all --objects > /tmp/git-backup/all-objects.txt
 
-          echo "Blob created: $BLOB_SHA"
+          OBJECT_COUNT=$(wc -l < /tmp/git-backup/all-objects.txt)
 
-          echo "SUCCESS: Git Database API is working."
+          echo "Reachable objects listed: ${OBJECT_COUNT}"
+
+          #
+          # We use git cat-file to inspect the Git object database.
+          #
+          declare -A OBJECT_MAP
+
+          echo
+          echo "========================================"
+          echo "Uploading Git objects"
+          echo "========================================"
+
+          #
+          # Upload blobs first.
+          #
+          git rev-list --objects --all |
+          while read -r SHA PATHNAME; do
+
+            TYPE=$(git cat-file -t "${SHA}")
+
+            if [ "${TYPE}" != "blob" ]; then
+              continue
+            fi
+
+            SIZE=$(git cat-file -s "${SHA}")
+
+            echo "Blob ${SHA} (${SIZE} bytes)"
+
+            if [ "${SIZE}" -gt 100000000 ]; then
+              echo "ERROR: Blob ${SHA} is larger than GitHub's 100 MB API limit."
+              echo "If this repository uses Git LFS, LFS requires separate handling."
+              exit 1
+            fi
+
+            CONTENT_FILE="/tmp/git-backup/blob-${SHA}"
+
+            git cat-file blob "${SHA}" > "${CONTENT_FILE}"
+
+            BASE64_CONTENT=$(base64 -w 0 "${CONTENT_FILE}")
+
+            NEW_SHA=$(gh api \
+              --method POST \
+              "repos/${OWNER}/${BACKUP_REPO}/git/blobs" \
+              -f content="${BASE64_CONTENT}" \
+              -f encoding="base64" \
+              --jq '.sha')
+
+            if [ "${NEW_SHA}" != "${SHA}" ]; then
+              echo "ERROR: Blob SHA changed."
+              echo "Source : ${SHA}"
+              echo "Backup : ${NEW_SHA}"
+              exit 1
+            fi
+
+          done
+
+          echo
+          echo "All blobs uploaded."
+
+          echo
+          echo "========================================"
+          echo "Recreating trees and commits"
+          echo "========================================"
+
+          #
+          # Create a temporary mapping database.
+          #
+          rm -f /tmp/git-backup/object-map.txt
+
+          #
+          # Process commits from oldest to newest.
+          #
+          git rev-list --all --topo-order --reverse |
+          while read -r COMMIT; do
+
+            echo
+            echo "Processing commit:"
+            echo "${COMMIT}"
+
+            TREE=$(git rev-parse "${COMMIT}^{tree}")
+
+            echo "Tree: ${TREE}"
+
+            #
+            # Create tree recursively using GitHub's Git Trees API.
+            #
+            TREE_JSON="/tmp/git-backup/tree-${TREE}.json"
+
+            if [ ! -f "${TREE_JSON}" ]; then
+
+              git ls-tree -r -z "${TREE}" > "/tmp/git-backup/tree-${TREE}.raw"
+
+              python3 - \
+                "${TREE}" \
+                "${OWNER}" \
+                "${BACKUP_REPO}" \
+                "${TREE_JSON}" <<'PY'
+          import sys
+          import subprocess
+          import json
+          import base64
+
+          tree_sha = sys.argv[1]
+          owner = sys.argv[2]
+          repo = sys.argv[3]
+          output = sys.argv[4]
+
+          raw = open(f"/tmp/git-backup/tree-{tree_sha}.raw", "rb").read()
+
+          entries = []
+
+          for item in raw.split(b"\0"):
+              if not item:
+                  continue
+
+              header, pathname = item.split(b"\t", 1)
+
+              mode, sha = header.decode().split(" ", 1)
+
+              entries.append({
+                  "path": pathname.decode("utf-8", errors="surrogateescape"),
+                  "mode": mode,
+                  "type": "blob",
+                  "sha": sha
+              })
+
+          with open(output, "w") as f:
+              json.dump(entries, f)
+          PY
+
+              TREE_ENTRIES=$(cat "${TREE_JSON}")
+
+              NEW_TREE=$(gh api \
+                --method POST \
+                "repos/${OWNER}/${BACKUP_REPO}/git/trees" \
+                -f tree="${TREE_ENTRIES}" \
+                --jq '.sha')
+
+              echo "${TREE}:${NEW_TREE}" >> /tmp/git-backup/tree-map.txt
+
+            else
+
+              NEW_TREE=$(grep "^${TREE}:" /tmp/git-backup/tree-map.txt | tail -1 | cut -d: -f2)
+
+            fi
+
+            #
+            # Read original commit metadata.
+            #
+            MESSAGE=$(git log -1 --format=%B "${COMMIT}")
+
+            AUTHOR_NAME=$(git log -1 --format=%an "${COMMIT}")
+            AUTHOR_EMAIL=$(git log -1 --format=%ae "${COMMIT}")
+            AUTHOR_DATE=$(git log -1 --format=%aI "${COMMIT}")
+
+            COMMITTER_NAME=$(git log -1 --format=%cn "${COMMIT}")
+            COMMITTER_EMAIL=$(git log -1 --format=%ce "${COMMIT}")
+            COMMITTER_DATE=$(git log -1 --format=%cI "${COMMIT}")
+
+            PARENTS=$(git rev-list --parents -n 1 "${COMMIT}")
+
+            PARENT_ARGS=()
+
+            for PARENT in ${PARENTS}; do
+              if [ "${PARENT}" = "${COMMIT}" ]; then
+                continue
+              fi
+
+              PARENT_ARGS+=(--arg "parent" "${PARENT}")
+            done
+
+            #
+            # Build commit JSON.
+            #
+            COMMIT_JSON="/tmp/git-backup/commit-${COMMIT}.json"
+
+            python3 - \
+              "${COMMIT}" \
+              "${NEW_TREE}" \
+              "${MESSAGE}" \
+              "${AUTHOR_NAME}" \
+              "${AUTHOR_EMAIL}" \
+              "${AUTHOR_DATE}" \
+              "${COMMITTER_NAME}" \
+              "${COMMITTER_EMAIL}" \
+              "${COMMITTER_DATE}" \
+              "${OWNER}" \
+              "${BACKUP_REPO}" \
+              "${COMMIT_JSON}" <<'PY'
+          import sys
+          import json
+
+          (
+              original,
+              tree,
+              message,
+              author_name,
+              author_email,
+              author_date,
+              committer_name,
+              committer_email,
+              committer_date,
+              owner,
+              repo,
+              output
+          ) = sys.argv[1:]
+
+          data = {
+              "message": message,
+              "tree": tree,
+              "author": {
+                  "name": author_name,
+                  "email": author_email,
+                  "date": author_date
+              },
+              "committer": {
+                  "name": committer_name,
+                  "email": committer_email,
+                  "date": committer_date
+              }
+          }
+
+          with open(output, "w") as f:
+              json.dump(data, f)
+          PY
+
+            #
+            # Add parents.
+            #
+            PARENT_JSON=$(git rev-list --parents -n 1 "${COMMIT}" | cut -d' ' -f2-)
+
+            if [ -n "${PARENT_JSON}" ]; then
+              python3 - \
+                "${COMMIT_JSON}" \
+                "${PARENT_JSON}" <<'PY'
+          import sys
+          import json
+
+          filename = sys.argv[1]
+          parents = sys.argv[2:]
+
+          data = json.load(open(filename))
+          data["parents"] = parents
+
+          with open(filename, "w") as f:
+              json.dump(data, f)
+          PY
+            fi
+
+            NEW_COMMIT=$(gh api \
+              --method POST \
+              "repos/${OWNER}/${BACKUP_REPO}/git/commits" \
+              --input "${COMMIT_JSON}" \
+              --jq '.sha')
+
+            echo "Created commit: ${NEW_COMMIT}"
+
+            #
+            # Save source -> destination commit mapping.
+            #
+            echo "${COMMIT}:${NEW_COMMIT}" >> /tmp/git-backup/commit-map.txt
+
+          done
+
+          echo
+          echo "========================================"
+          echo "Restoring branches"
+          echo "========================================"
+
+          git for-each-ref \
+            --format='%(refname) %(objectname)' \
+            refs/remotes/origin |
+          while read -r REF SHA; do
+
+            BRANCH="${REF#refs/remotes/origin/}"
+
+            if [ "${BRANCH}" = "HEAD" ]; then
+              continue
+            fi
+
+            DEST=$(grep "^${SHA}:" /tmp/git-backup/commit-map.txt | tail -1 | cut -d: -f2)
+
+            if [ -z "${DEST}" ]; then
+              echo "WARNING: Could not map branch ${BRANCH}"
+              continue
+            fi
+
+            echo "Branch: ${BRANCH} -> ${DEST}"
+
+            gh api \
+              --method POST \
+              "repos/${OWNER}/${BACKUP_REPO}/git/refs" \
+              -f ref="refs/heads/${BRANCH}" \
+              -f sha="${DEST}"
+
+          done
+
+          #
+          # Also make sure main exists.
+          #
+          MAIN_SHA=$(git rev-parse refs/remotes/origin/main)
+
+          MAIN_DEST=$(grep "^${MAIN_SHA}:" /tmp/git-backup/commit-map.txt | tail -1 | cut -d: -f2)
+
+          if [ -n "${MAIN_DEST}" ]; then
+
+            gh api \
+              --method PATCH \
+              "repos/${OWNER}/${BACKUP_REPO}/git/refs/heads/main" \
+              -f sha="${MAIN_DEST}" \
+              -F force=true
+
+          fi
+
+          echo
+          echo "========================================"
+          echo "Restoring tags"
+          echo "========================================"
+
+          git for-each-ref \
+            --format='%(refname) %(objectname) %(objecttype)' \
+            refs/tags |
+          while read -r REF SHA TYPE; do
+
+            TAG="${REF#refs/tags/}"
+
+            echo "Tag: ${TAG}"
+
+            if [ "${TYPE}" = "commit" ]; then
+
+              DEST=$(grep "^${SHA}:" /tmp/git-backup/commit-map.txt | tail -1 | cut -d: -f2)
+
+              if [ -z "${DEST}" ]; then
+                echo "WARNING: Could not map tag ${TAG}"
+                continue
+              fi
+
+              gh api \
+                --method POST \
+                "repos/${OWNER}/${BACKUP_REPO}/git/refs" \
+                -f ref="refs/tags/${TAG}" \
+                -f sha="${DEST}"
+
+            else
+
+              echo "Annotated tag detected: ${TAG}"
+
+              TAG_MESSAGE=$(git for-each-ref \
+                --format='%(contents)' \
+                "${REF}")
+
+              TAGGER_NAME=$(git for-each-ref \
+                --format='%(taggername)' \
+                "${REF}")
+
+              TAGGER_EMAIL=$(git for-each-ref \
+                --format='%(taggeremail)' \
+                "${REF}")
+
+              TAGGER_DATE=$(git for-each-ref \
+                --format='%(taggerdate:iso-strict)' \
+                "${REF}")
+
+              TARGET=$(git rev-parse "${REF}^{}")
+
+              DEST=$(grep "^${TARGET}:" /tmp/git-backup/commit-map.txt | tail -1 | cut -d: -f2)
+
+              if [ -z "${DEST}" ]; then
+                echo "WARNING: Could not map annotated tag ${TAG}"
+                continue
+              fi
+
+              TAG_SHA=$(gh api \
+                --method POST \
+                "repos/${OWNER}/${BACKUP_REPO}/git/tags" \
+                -f tag="${TAG}" \
+                -f message="${TAG_MESSAGE}" \
+                -f object="${DEST}" \
+                -f type="commit" \
+                -f "tagger[name]=${TAGGER_NAME}" \
+                -f "tagger[email]=${TAGGER_EMAIL}" \
+                -f "tagger[date]=${TAGGER_DATE}" \
+                --jq '.sha')
+
+              gh api \
+                --method POST \
+                "repos/${OWNER}/${BACKUP_REPO}/git/refs" \
+                -f ref="refs/tags/${TAG}" \
+                -f sha="${TAG_SHA}"
+
+            fi
+
+          done
+
+          echo
+          echo "========================================"
+          echo "BACKUP COMPLETED"
+          echo "========================================"
+          echo "Backup repository:"
+          echo "https://github.com/${OWNER}/${BACKUP_REPO}"
+          echo "========================================"
