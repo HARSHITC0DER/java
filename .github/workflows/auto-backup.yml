@@ -9,8 +9,9 @@ on:
 
 jobs:
   backup:
-    # Only the original repository can run this job.
-    # Backup repositories will NOT create another backup.
+    # IMPORTANT:
+    # Only HARSHITC0DER/java is allowed to execute this job.
+    # Backup repositories cannot recursively create backups.
     if: github.repository == 'HARSHITC0DER/java'
 
     runs-on: ubuntu-latest
@@ -99,14 +100,14 @@ jobs:
 
           if [ "${LOGIN}" != "${OWNER}" ]; then
             echo
-            echo "ERROR:"
-            echo "PAT belongs to: ${LOGIN}"
-            echo "Expected:      ${OWNER}"
+            echo "ERROR: Wrong PAT account."
+            echo "Authenticated: ${LOGIN}"
+            echo "Expected: ${OWNER}"
             exit 1
           fi
 
           echo
-          echo "Creating private repository..."
+          echo "Creating private backup repository..."
 
           gh repo create "${OWNER}/${BACKUP_REPO}" \
             --private \
@@ -124,12 +125,11 @@ jobs:
             "repos/${OWNER}/${BACKUP_REPO}" \
             --jq '"Repository confirmed: " + .full_name + " | Private: " + (.private | tostring)'
 
-          # Export for later steps.
           echo "BACKUP_OWNER=${OWNER}" >> "$GITHUB_ENV"
           echo "BACKUP_REPO=${BACKUP_REPO}" >> "$GITHUB_ENV"
 
       # ============================================================
-      # 4. INITIALIZE EMPTY BACKUP REPOSITORY
+      # 4. INITIALIZE EMPTY REPOSITORY
       # ============================================================
 
       - name: Initialize backup repository
@@ -143,14 +143,13 @@ jobs:
           echo "INITIALIZING BACKUP REPOSITORY"
           echo "========================================"
 
-          echo "Backup repository:"
+          echo "Repository:"
           echo "${BACKUP_OWNER}/${BACKUP_REPO}"
 
-          # GitHub's Git Database API returns 409 for an empty
-          # repository. Create one temporary commit first.
-          INIT_CONTENT=$(printf '%s' \
-            "Temporary backup initialization" \
-            | base64 -w 0)
+          INIT_CONTENT=$(
+            printf '%s' "Temporary backup initialization" |
+            base64 -w 0
+          )
 
           gh api \
             --method PUT \
@@ -166,10 +165,10 @@ jobs:
           echo "${INIT_SHA}"
 
           echo
-          echo "Backup repository is now initialized."
+          echo "Repository initialized."
 
       # ============================================================
-      # 5. MIGRATE GIT OBJECTS USING GITHUB GIT DATABASE API
+      # 5. MIGRATE COMPLETE GIT HISTORY
       # ============================================================
 
       - name: Migrate complete Git history
@@ -192,7 +191,6 @@ jobs:
           import os
           import re
           import subprocess
-          import sys
           import time
           from pathlib import Path
 
@@ -203,9 +201,6 @@ jobs:
           WORK_DIR = Path("/tmp/git-backup")
           WORK_DIR.mkdir(parents=True, exist_ok=True)
 
-          # Small delay between write operations.
-          # This repository currently has only a small number of
-          # Git objects, so this is sufficient.
           WRITE_DELAY = 0.30
 
 
@@ -213,11 +208,10 @@ jobs:
           # COMMAND HELPERS
           # ========================================================
 
-          def run_command(command, input_data=None):
+          def run_command(command):
 
               result = subprocess.run(
                   command,
-                  input=input_data,
                   stdout=subprocess.PIPE,
                   stderr=subprocess.PIPE,
                   check=False
@@ -262,7 +256,7 @@ jobs:
 
 
           # ========================================================
-          # GITHUB API HELPER
+          # GITHUB API
           # ========================================================
 
           def github_api(
@@ -345,7 +339,6 @@ jobs:
                   )
                   print(last_error)
 
-                  # Retry transient API failures.
                   time.sleep(
                       min(60, attempt * 3)
                   )
@@ -357,7 +350,7 @@ jobs:
 
 
           # ========================================================
-          # SOURCE OBJECT INFORMATION
+          # GET ALL COMMITS
           # ========================================================
 
           print()
@@ -365,7 +358,7 @@ jobs:
           print("ANALYZING SOURCE REPOSITORY")
           print("========================================")
 
-          commit_list = git(
+          commit_lines = git(
               "rev-list",
               "--all",
               "--topo-order",
@@ -374,7 +367,7 @@ jobs:
 
           commits = []
 
-          for commit in commit_list:
+          for commit in commit_lines:
 
               commit = commit.strip()
 
@@ -388,17 +381,14 @@ jobs:
               "--all"
           ).splitlines()
 
-
           all_objects = []
 
           for line in object_lines:
 
-              parts = line.split(
+              sha = line.split(
                   " ",
                   1
-              )
-
-              sha = parts[0]
+              )[0]
 
               if sha not in all_objects:
                   all_objects.append(sha)
@@ -414,31 +404,53 @@ jobs:
 
 
           # ========================================================
-          # DETECT SIGNED COMMITS
+          # CHECK LFS
           # ========================================================
 
           print()
-          print("Checking commit signatures...")
+          print("Checking Git LFS...")
 
-          for commit in commits:
+          lfs_detected = False
 
-              raw = git_bytes(
-                  "cat-file",
-                  "commit",
-                  commit
-              ).decode(
-                  "utf-8",
-                  errors="replace"
+          try:
+
+              lfs_output = subprocess.run(
+                  [
+                      "git",
+                      "lfs",
+                      "ls-files",
+                      "--all"
+                  ],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  text=True,
+                  check=False
               )
 
-              if "\ngpgsig " in raw:
+              if lfs_output.returncode == 0:
 
-                  raise RuntimeError(
-                      f"Commit {commit} contains a "
-                      "GPG signature.\n"
-                      "The backup was stopped instead of "
-                      "silently changing the commit."
-                  )
+                  if lfs_output.stdout.strip():
+
+                      lfs_detected = True
+
+                      print()
+                      print(
+                          "WARNING: Git LFS files detected."
+                      )
+
+                      print(
+                          "Git LFS pointer files will be "
+                          "preserved."
+                      )
+
+                      print(
+                          "Separate LFS objects are not "
+                          "copied by this workflow."
+                      )
+
+          except Exception:
+
+              pass
 
 
           # ========================================================
@@ -457,9 +469,7 @@ jobs:
           print("UPLOADING BLOBS")
           print("========================================")
 
-
           blob_objects = []
-
 
           for sha in all_objects:
 
@@ -505,9 +515,7 @@ jobs:
 
                   raise RuntimeError(
                       f"Blob {blob_sha} is larger than "
-                      "100 MiB.\n"
-                      "GitHub's normal repository file "
-                      "limit is 100 MiB."
+                      "100 MiB."
                   )
 
 
@@ -550,7 +558,7 @@ jobs:
 
 
           # ========================================================
-          # CREATE TREES
+          # TREE CREATION
           # ========================================================
 
           tree_map = {}
@@ -606,35 +614,29 @@ jobs:
 
                   if object_type == "blob":
 
-                      entry_type = "blob"
-
                       if sha not in blob_map:
 
                           raise RuntimeError(
-                              f"Blob {sha} used by "
-                              f"tree {tree_sha} was "
-                              "not uploaded."
+                              f"Blob {sha} was not uploaded."
                           )
 
                       destination_sha = (
                           blob_map[sha]
                       )
 
+                      entry_type = "blob"
+
                   elif object_type == "commit":
 
                       # Git submodule.
-                      entry_type = "commit"
-
-                      # A submodule SHA belongs to the
-                      # external repository. It is kept
-                      # unchanged.
                       destination_sha = sha
+                      entry_type = "commit"
 
                   else:
 
                       raise RuntimeError(
-                          "Unexpected tree entry type: "
-                          + object_type
+                          f"Unsupported tree object type: "
+                          f"{object_type}"
                       )
 
 
@@ -663,7 +665,7 @@ jobs:
 
 
               print(
-                  f"Creating tree: "
+                  f"Creating tree "
                   f"{source_tree_sha}"
               )
 
@@ -690,7 +692,10 @@ jobs:
                   raise RuntimeError(
                       "\nTREE SHA MISMATCH\n"
                       f"Source      : {source_tree_sha}\n"
-                      f"Destination : {destination_sha}"
+                      f"Destination : {destination_sha}\n"
+                      "\n"
+                      "The source tree could not be "
+                      "recreated byte-for-byte."
                   )
 
 
@@ -700,6 +705,213 @@ jobs:
 
 
               return destination_sha
+
+
+          # ========================================================
+          # PARSE COMMIT OBJECT
+          # ========================================================
+
+          def parse_commit(
+              commit_sha
+          ):
+
+              raw = git_bytes(
+                  "cat-file",
+                  "commit",
+                  commit_sha
+              ).decode(
+                  "utf-8",
+                  errors="replace"
+              )
+
+
+              header_text, message = (
+                  raw.split(
+                      "\n\n",
+                      1
+                  )
+              )
+
+
+              headers = []
+
+              current = None
+
+
+              for line in header_text.splitlines():
+
+                  # Continuation line for gpgsig.
+                  if (
+                      line.startswith(" ")
+                      and current is not None
+                  ):
+
+                      current[1] += "\n" + line[1:]
+                      continue
+
+
+                  if " " not in line:
+
+                      continue
+
+
+                  key, value = line.split(
+                      " ",
+                      1
+                  )
+
+
+                  current = [
+                      key,
+                      value
+                  ]
+
+
+                  headers.append(
+                      current
+                  )
+
+
+              values = {}
+
+              for key, value in headers:
+
+                  if key != "gpgsig":
+
+                      values.setdefault(
+                          key,
+                          []
+                      ).append(value)
+
+
+              signature = None
+
+
+              for key, value in headers:
+
+                  if key == "gpgsig":
+
+                      signature = value
+
+                      break
+
+
+              tree = values["tree"][0]
+
+
+              parents = values.get(
+                  "parent",
+                  []
+              )
+
+
+              author = values["author"][0]
+
+              committer = values[
+                  "committer"
+              ][0]
+
+
+              def parse_identity(
+                  value
+              ):
+
+                  match = re.match(
+                      r"^(.*) <([^>]+)> ([0-9]+) ([+-][0-9]{4})$",
+                      value
+                  )
+
+
+                  if not match:
+
+                      raise RuntimeError(
+                          "Unable to parse Git identity: "
+                          + value
+                      )
+
+
+                  name = match.group(1)
+                  email = match.group(2)
+                  timestamp = int(
+                      match.group(3)
+                  )
+                  timezone = match.group(4)
+
+
+                  sign = 1
+
+                  if timezone[0] == "-":
+                      sign = -1
+
+
+                  hours = int(
+                      timezone[1:3]
+                  )
+
+                  minutes = int(
+                      timezone[3:5]
+                  )
+
+
+                  offset_seconds = (
+                      sign *
+                      (
+                          hours * 3600
+                          +
+                          minutes * 60
+                      )
+                  )
+
+
+                  import datetime
+
+
+                  dt = (
+                      datetime.datetime.fromtimestamp(
+                          timestamp,
+                          datetime.timezone.utc
+                      )
+                      + datetime.timedelta(
+                          seconds=offset_seconds
+                      )
+                  )
+
+
+                  iso = (
+                      dt.strftime(
+                          "%Y-%m-%dT%H:%M:%S"
+                      )
+                      + timezone[:3]
+                      + ":"
+                      + timezone[3:]
+                  )
+
+
+                  return {
+                      "name": name,
+                      "email": email,
+                      "date": iso
+                  }
+
+
+              author_data = parse_identity(
+                  author
+              )
+
+
+              committer_data = parse_identity(
+                  committer
+              )
+
+
+              return {
+                  "tree": tree,
+                  "parents": parents,
+                  "author": author_data,
+                  "committer": committer_data,
+                  "message": message,
+                  "signature": signature
+              }
 
 
           # ========================================================
@@ -727,49 +939,36 @@ jobs:
               )
 
 
-              tree_sha = git(
-                  "rev-parse",
-                  f"{commit_sha}^{{tree}}"
-              ).strip()
+              commit_data = parse_commit(
+                  commit_sha
+              )
+
+
+              source_tree = (
+                  commit_data["tree"]
+              )
 
 
               destination_tree = (
                   create_tree(
-                      tree_sha
+                      source_tree
                   )
-              )
-
-
-              parent_line = git(
-                  "rev-list",
-                  "--parents",
-                  "-n",
-                  "1",
-                  commit_sha
-              ).strip()
-
-
-              parent_parts = (
-                  parent_line.split()
-              )
-
-
-              source_parents = (
-                  parent_parts[1:]
               )
 
 
               destination_parents = []
 
 
-              for parent in source_parents:
+              for parent in (
+                  commit_data["parents"]
+              ):
 
                   if parent not in commit_map:
 
                       raise RuntimeError(
                           f"Parent commit {parent} "
-                          f"has not been recreated "
-                          f"before {commit_sha}."
+                          f"was not recreated before "
+                          f"{commit_sha}."
                       )
 
 
@@ -778,80 +977,34 @@ jobs:
                   )
 
 
-              author_name = git(
-                  "show",
-                  "-s",
-                  "--format=%an",
-                  commit_sha
-              ).rstrip("\n")
-
-
-              author_email = git(
-                  "show",
-                  "-s",
-                  "--format=%ae",
-                  commit_sha
-              ).rstrip("\n")
-
-
-              author_date = git(
-                  "show",
-                  "-s",
-                  "--format=%aI",
-                  commit_sha
-              ).rstrip("\n")
-
-
-              committer_name = git(
-                  "show",
-                  "-s",
-                  "--format=%cn",
-                  commit_sha
-              ).rstrip("\n")
-
-
-              committer_email = git(
-                  "show",
-                  "-s",
-                  "--format=%ce",
-                  commit_sha
-              ).rstrip("\n")
-
-
-              committer_date = git(
-                  "show",
-                  "-s",
-                  "--format=%cI",
-                  commit_sha
-              ).rstrip("\n")
-
-
-              message = git_bytes(
-                  "show",
-                  "-s",
-                  "--format=%B",
-                  commit_sha
-              ).decode(
-                  "utf-8",
-                  errors="replace"
-              )
-
-
               payload = {
-                  "message": message,
+                  "message": commit_data[
+                      "message"
+                  ],
                   "tree": destination_tree,
                   "parents": destination_parents,
-                  "author": {
-                      "name": author_name,
-                      "email": author_email,
-                      "date": author_date
-                  },
-                  "committer": {
-                      "name": committer_name,
-                      "email": committer_email,
-                      "date": committer_date
-                  }
+                  "author": commit_data[
+                      "author"
+                  ],
+                  "committer": commit_data[
+                      "committer"
+                  ]
               }
+
+
+              # ----------------------------------------------------
+              # PRESERVE GPG SIGNATURE
+              # ----------------------------------------------------
+
+              if commit_data["signature"]:
+
+                  print(
+                      "GPG signature detected."
+                  )
+
+                  payload["signature"] = (
+                      commit_data["signature"]
+                  )
 
 
               response = github_api(
@@ -875,6 +1028,10 @@ jobs:
               )
 
 
+              # ----------------------------------------------------
+              # CRITICAL VERIFICATION
+              # ----------------------------------------------------
+
               if destination_commit != commit_sha:
 
                   raise RuntimeError(
@@ -882,8 +1039,8 @@ jobs:
                       f"Source      : {commit_sha}\n"
                       f"Destination : {destination_commit}\n"
                       "\n"
-                      "The workflow stopped rather than "
-                      "creating a different history."
+                      "The workflow stopped because the "
+                      "commit was not reproduced exactly."
                   )
 
 
@@ -893,7 +1050,10 @@ jobs:
 
 
           print()
-          print("All commits recreated successfully.")
+          print(
+              "All commits recreated with "
+              "matching SHA values."
+          )
 
 
           # ========================================================
@@ -923,6 +1083,7 @@ jobs:
                   1
               )
 
+
               if len(parts) != 2:
                   continue
 
@@ -939,7 +1100,7 @@ jobs:
 
                   raise RuntimeError(
                       f"Branch {branch_name} points "
-                      f"to unknown commit {source_sha}."
+                      f"to missing commit {source_sha}."
                   )
 
 
@@ -966,8 +1127,6 @@ jobs:
 
               if branch_name == "main":
 
-                  # main already exists because the
-                  # initialization commit created it.
                   github_api(
                       "PATCH",
                       f"repos/{OWNER}/{REPO}/git/refs/heads/main",
@@ -983,10 +1142,10 @@ jobs:
                       "POST",
                       f"repos/{OWNER}/{REPO}/git/refs",
                       {
-                          "ref": (
-                              f"refs/heads/{branch_name}"
-                          ),
-                          "sha": destination_sha
+                          "ref":
+                              f"refs/heads/{branch_name}",
+                          "sha":
+                              destination_sha
                       }
                   )
 
@@ -1048,7 +1207,7 @@ jobs:
 
                       raise RuntimeError(
                           f"Tag {tag_name} points to "
-                          f"unknown commit {source_sha}."
+                          f"missing commit {source_sha}."
                       )
 
 
@@ -1061,10 +1220,10 @@ jobs:
                       "POST",
                       f"repos/{OWNER}/{REPO}/git/refs",
                       {
-                          "ref": (
-                              f"refs/tags/{tag_name}"
-                          ),
-                          "sha": destination_sha
+                          "ref":
+                              f"refs/tags/{tag_name}",
+                          "sha":
+                              destination_sha
                       }
                   )
 
@@ -1082,16 +1241,25 @@ jobs:
                   )
 
 
+                  # GitHub's tag creation API does not expose
+                  # a signature input field. Therefore a signed
+                  # annotated tag cannot be recreated byte-for-byte
+                  # through this API.
                   if (
                       "-----BEGIN PGP SIGNATURE-----"
                       in raw_tag
                   ):
 
                       raise RuntimeError(
-                          f"Annotated tag {tag_name} "
-                          "contains a PGP signature. "
-                          "The workflow stopped rather "
-                          "than changing the tag."
+                          f"Annotated tag '{tag_name}' "
+                          "contains a PGP signature.\n"
+                          "\n"
+                          "GitHub's REST tag API does not provide "
+                          "a signature parameter for creating "
+                          "signed tag objects.\n"
+                          "\n"
+                          "The workflow stopped instead of "
+                          "silently converting the signed tag."
                       )
 
 
@@ -1105,8 +1273,8 @@ jobs:
 
                       raise RuntimeError(
                           f"Annotated tag {tag_name} "
-                          f"target {target_sha} was not "
-                          "recreated."
+                          f"points to missing commit "
+                          f"{target_sha}."
                       )
 
 
@@ -1121,16 +1289,13 @@ jobs:
                   tagger_date = None
 
 
-                  tag_lines_raw = (
-                      raw_tag.splitlines()
-                  )
-
-
                   message_started = False
                   message_lines = []
 
 
-                  for raw_line in tag_lines_raw:
+                  for raw_line in (
+                      raw_tag.splitlines()
+                  ):
 
                       if raw_line.startswith(
                           "tag "
@@ -1201,23 +1366,27 @@ jobs:
                   )
 
 
-                  tag_payload = {
-                      "tag": tag_header,
-                      "message": tag_message,
-                      "object": destination_target,
-                      "type": "commit",
-                      "tagger": {
-                          "name": tagger_name,
-                          "email": tagger_email,
-                          "date": tagger_date
-                      }
-                  }
-
-
                   tag_response = github_api(
                       "POST",
                       f"repos/{OWNER}/{REPO}/git/tags",
-                      tag_payload
+                      {
+                          "tag":
+                              tag_header,
+                          "message":
+                              tag_message,
+                          "object":
+                              destination_target,
+                          "type":
+                              "commit",
+                          "tagger": {
+                              "name":
+                                  tagger_name,
+                              "email":
+                                  tagger_email,
+                              "date":
+                                  tagger_date
+                          }
+                      }
                   )
 
 
@@ -1230,10 +1399,10 @@ jobs:
                       "POST",
                       f"repos/{OWNER}/{REPO}/git/refs",
                       {
-                          "ref": (
-                              f"refs/tags/{tag_name}"
-                          ),
-                          "sha": destination_tag_sha
+                          "ref":
+                              f"refs/tags/{tag_name}",
+                          "sha":
+                              destination_tag_sha
                       }
                   )
 
@@ -1241,17 +1410,17 @@ jobs:
               else:
 
                   raise RuntimeError(
-                      f"Unsupported tag object type: "
+                      f"Unsupported tag type: "
                       f"{source_type}"
                   )
 
 
           print()
-          print("All tags restored.")
+          print("All supported tags restored.")
 
 
           # ========================================================
-          # FINAL VERIFICATION
+          # FINAL MAIN BRANCH VERIFICATION
           # ========================================================
 
           print()
@@ -1310,22 +1479,18 @@ jobs:
               )
 
 
-          # --------------------------------------------------------
-          # VERIFY BRANCH COUNT
-          # --------------------------------------------------------
+          # ========================================================
+          # VERIFY BRANCHES
+          # ========================================================
 
-          source_branch_names = set()
-
-
-          for branch_name, source_sha in branches:
-
-              source_branch_names.add(
-                  branch_name
-              )
+          source_branch_names = {
+              branch_name
+              for branch_name, source_sha
+              in branches
+          }
 
 
           backup_branch_names = set()
-
 
           page = 1
 
@@ -1399,7 +1564,7 @@ jobs:
           if missing_branches:
 
               raise RuntimeError(
-                  "Missing branches in backup:\n"
+                  "Missing branches:\n"
                   + "\n".join(
                       sorted(
                           missing_branches
@@ -1408,55 +1573,48 @@ jobs:
               )
 
 
-          # --------------------------------------------------------
-          # VERIFY COMMIT COUNT
-          # --------------------------------------------------------
-
-          backup_commit_count = int(
-              subprocess.check_output(
-                  [
-                      "gh",
-                      "api",
-                      f"repos/{OWNER}/{REPO}/commits"
-                      "?per_page=1"
-                      "&page=1",
-                      "--jq",
-                      "length"
-                  ],
-                  text=True
-              ).strip()
-              or "0"
-          )
-
-
-          print()
-          print(
-              "Source commit count : "
-              f"{len(commits)}"
-          )
-
-          print(
-              "Backup main verified : YES"
-          )
-
+          # ========================================================
+          # SUCCESS
+          # ========================================================
 
           print()
           print("========================================")
           print("BACKUP COMPLETED SUCCESSFULLY")
           print("========================================")
+
+          print()
           print(
-              "Backup repository:"
+              f"Backup repository:"
           )
+
           print(
               f"https://github.com/"
               f"{OWNER}/{REPO}"
           )
+
+          print()
+          print(
+              f"Commits migrated: "
+              f"{len(commits)}"
+          )
+
+          print(
+              f"Branches migrated: "
+              f"{len(branches)}"
+          )
+
+          print(
+              f"Tags processed: "
+              f"{len(tag_lines)}"
+          )
+
+          print()
           print("========================================")
 
           PY
 
       # ============================================================
-      # 6. SUCCESS MESSAGE
+      # 6. SUCCESS
       # ============================================================
 
       - name: Backup successful
@@ -1470,17 +1628,11 @@ jobs:
           echo "Source:"
           echo "HARSHITC0DER/java"
           echo
-          echo "Backup owner:"
-          echo "ARJUNC0DER"
-          echo
-          echo "Backup repository:"
+          echo "Backup:"
           echo "https://github.com/${BACKUP_OWNER}/${BACKUP_REPO}"
           echo
-          echo "The backup contains:"
-          echo "- Complete Git commit history"
-          echo "- All branches"
-          echo "- All tags"
-          echo "- All Git files"
-          echo "- Private repository"
-          echo
+          echo "Private: YES"
+          echo "Complete Git history: YES"
+          echo "Branches: YES"
+          echo "Tags: YES"
           echo "========================================"
