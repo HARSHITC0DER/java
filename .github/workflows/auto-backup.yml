@@ -1,4 +1,4 @@
-name: Test Git Database API
+name: Test Git Datassbase API
 
 on:
   workflow_dispatch:
