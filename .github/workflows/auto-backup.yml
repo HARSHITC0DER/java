@@ -1,4 +1,4 @@
-name: Test Git Datassbase API
+name: Test Git Datadddbase API
 
 on:
   workflow_dispatch:
@@ -25,12 +25,30 @@ jobs:
           REPO="git-api-test-${TIMESTAMP}"
 
           echo "Creating repository..."
-          
+
           gh repo create "$OWNER/$REPO" --private
 
           echo "Repository: $OWNER/$REPO"
 
-          echo "Creating test blob..."
+          echo "Creating initial file through Contents API..."
+
+          echo "Git Database API test" > test.txt
+
+          CONTENT=$(base64 -w 0 test.txt)
+
+          RESULT=$(gh api \
+            --method PUT \
+            "repos/${OWNER}/${REPO}/contents/test.txt" \
+            -f message="Initial commit" \
+            -f content="$CONTENT")
+
+          COMMIT_SHA=$(echo "$RESULT" | jq -r '.commit.sha')
+
+          echo "Initial commit created: $COMMIT_SHA"
+
+          echo "Repository is no longer empty."
+
+          echo "Testing Git Database API..."
 
           BLOB_SHA=$(gh api \
             --method POST \
