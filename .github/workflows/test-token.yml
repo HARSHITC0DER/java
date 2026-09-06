@@ -19,10 +19,10 @@ jobs:
           gh api user \
             --jq '"Authenticated account: " + .login'
 
-          echo "Checking repository access..."
+          echo "Checking ARJUNC0DER repositories..."
 
-          gh api repos/ARJUNC0DER \
-            --jq '"Account found: " + .login'
+          gh api "user/repos?per_page=5" \
+            --jq '.[] | .full_name + " | Private: " + (.private | tostring)'
 
           echo "Checking source repository..."
 
