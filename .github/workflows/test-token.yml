@@ -1,0 +1,32 @@
+name: Test Backup Token
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Test PAT
+        env:
+          GH_TOKEN: ${{ secrets.BACKUP_TOKEN }}
+        run: |
+          set -e
+
+          echo "Testing GitHub authentication..."
+
+          gh api user \
+            --jq '"Authenticated account: " + .login'
+
+          echo "Checking repository access..."
+
+          gh api repos/ARJUNC0DER \
+            --jq '"Account found: " + .login'
+
+          echo "Checking source repository..."
+
+          gh api repos/HARSHITC0DER/java \
+            --jq '"Source repository: " + .full_name'
+
+          echo "PAT test completed successfully."
