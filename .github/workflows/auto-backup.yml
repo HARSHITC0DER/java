@@ -1,99 +1,44 @@
-name: Full Private Git History Backup
+name: Test Git Database API
 
-"on":
-  push:
-    branches:
-      - main
-
+on:
   workflow_dispatch:
 
 jobs:
-  backup:
-    # Only the original repository can create backups.
-    if: github.repository == 'HARSHITC0DER/java'
-
+  test:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout complete Git repository
+      - name: Checkout complete history
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
           fetch-tags: true
 
-      - name: Create full private backup
+      - name: Test Git Database API
         env:
           GH_TOKEN: ${{ secrets.BACKUP_TOKEN }}
-          SOURCE_REPO: ${{ github.repository }}
-          COMMIT_SHA: ${{ github.sha }}
         run: |
           set -e
 
           OWNER="ARJUNC0DER"
-          REPO="${SOURCE_REPO#*/}"
-
           TIMESTAMP=$(date -u +"%Y%m%d-%H%M%S")
-          BACKUP_REPO="${REPO}-backup-${TIMESTAMP}"
+          REPO="git-api-test-${TIMESTAMP}"
 
-          echo "========================================"
-          echo "FULL PRIVATE GIT BACKUP"
-          echo "========================================"
-          echo "Source repository : $SOURCE_REPO"
-          echo "Backup owner      : $OWNER"
-          echo "Backup repository : $BACKUP_REPO"
-          echo "Commit            : $COMMIT_SHA"
-          echo "========================================"
+          echo "Creating repository..."
+          
+          gh repo create "$OWNER/$REPO" --private
 
-          # Verify PAT identity
-          LOGIN=$(gh api user --jq '.login')
+          echo "Repository: $OWNER/$REPO"
 
-          echo "Authenticated account: $LOGIN"
+          echo "Creating test blob..."
 
-          if [ "$LOGIN" != "$OWNER" ]; then
-            echo "ERROR: BACKUP_TOKEN belongs to $LOGIN"
-            echo "Expected: $OWNER"
-            exit 1
-          fi
+          BLOB_SHA=$(gh api \
+            --method POST \
+            "repos/${OWNER}/${REPO}/git/blobs" \
+            -f content="Git Database API test" \
+            -f encoding="utf-8" \
+            --jq '.sha')
 
-          # Create NEW PRIVATE repository
-          gh repo create "$OWNER/$BACKUP_REPO" \
-            --private \
-            --description "Complete private Git backup of $REPO at $COMMIT_SHA"
+          echo "Blob created: $BLOB_SHA"
 
-          echo "Private backup repository created."
-
-          # Verify that the repository exists and is private
-          gh api "repos/${OWNER}/${BACKUP_REPO}" \
-            --jq '"Repository confirmed: " + .full_name + " | Private: " + (.private | tostring)'
-
-          # Configure Git authentication
-          git config --global \
-            url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf \
-            "https://github.com/"
-
-          # Remove original remote
-          git remote remove origin || true
-
-          # Add backup repository
-          git remote add backup \
-            "https://github.com/${OWNER}/${BACKUP_REPO}.git"
-
-          echo "========================================"
-          echo "Pushing COMPLETE Git history..."
-          echo "========================================"
-
-          # Mirror ALL refs:
-          # - all branches
-          # - all tags
-          # - complete commit history
-          git push backup --mirror
-
-          echo "========================================"
-          echo "BACKUP SUCCESSFUL"
-          echo "========================================"
-          echo "Repository : ${OWNER}/${BACKUP_REPO}"
-          echo "Private    : YES"
-          echo "Commits    : ALL"
-          echo "Branches   : ALL"
-          echo "Tags       : ALL"
-          echo "========================================"
+          echo "SUCCESS: Git Database API is working."
