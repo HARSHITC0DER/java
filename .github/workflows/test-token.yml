@@ -1,4 +1,4 @@
-name: Test Git Push Access
+name: Test Git Push
 
 on:
   workflow_dispatch:
@@ -8,15 +8,26 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Test Git HTTPS authentication
+      - name: Checkout source
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Test push
         env:
           GH_TOKEN: ${{ secrets.BACKUP_TOKEN }}
         run: |
           set -e
 
-          echo "Testing Git access..."
+          git config user.name "ARJUNC0DER"
+          git config user.email "ARJUNC0DER@users.noreply.github.com"
 
-          git ls-remote \
+          git remote add backup \
             "https://x-access-token:${GH_TOKEN}@github.com/ARJUNC0DER/java-backup-20260826-101339.git"
 
-          echo "Git HTTPS authentication works."
+          echo "Testing mirror push..."
+
+          git push backup --mirror
+
+          echo "SUCCESS: Git mirror push completed."
