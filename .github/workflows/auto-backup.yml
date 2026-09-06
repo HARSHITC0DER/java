@@ -9,25 +9,25 @@ on:
 
 jobs:
   backup:
-    # VERY IMPORTANT:
-    # Only the original repository can run this workflow.
-    # Backup repositories will never create another backup.
+    # Only the original repository can execute this workflow.
+    # Backup repositories will not recursively create more backups.
     if: github.repository == 'HARSHITC0DER/java'
 
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout complete repository
+      - name: Checkout complete Git history
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
           fetch-tags: true
 
-      - name: Create complete private backup
+      - name: Create complete private Git backup
         env:
           GH_TOKEN: ${{ secrets.BACKUP_TOKEN }}
           SOURCE_REPO: ${{ github.repository }}
-          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_COMMIT: ${{ github.sha }}
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -43,7 +43,7 @@ jobs:
           echo "Source repository : ${SOURCE_REPO}"
           echo "Backup owner      : ${OWNER}"
           echo "Backup repository : ${BACKUP_REPO}"
-          echo "Source commit     : ${SOURCE_SHA}"
+          echo "Source commit     : ${SOURCE_COMMIT}"
           echo "========================================"
 
           echo
@@ -54,7 +54,8 @@ jobs:
           echo "Authenticated account: ${LOGIN}"
 
           if [ "${LOGIN}" != "${OWNER}" ]; then
-            echo "ERROR: PAT belongs to ${LOGIN}, expected ${OWNER}"
+            echo "ERROR: BACKUP_TOKEN belongs to ${LOGIN}"
+            echo "Expected account: ${OWNER}"
             exit 1
           fi
 
@@ -63,10 +64,10 @@ jobs:
 
           gh repo create "${OWNER}/${BACKUP_REPO}" \
             --private \
-            --description "Complete Git history backup of ${SOURCE_REPO} at ${SOURCE_SHA}"
+            --description "Complete Git history backup of ${SOURCE_REPO} at ${SOURCE_COMMIT}"
 
           echo
-          echo "Repository created:"
+          echo "Backup repository created:"
           echo "https://github.com/${OWNER}/${BACKUP_REPO}"
 
           gh api \
@@ -74,417 +75,1016 @@ jobs:
             --jq '"Repository confirmed: " + .full_name + " | Private: " + (.private | tostring)'
 
           echo
-          echo "========================================"
-          echo "Preparing Git objects"
-          echo "========================================"
+          echo "Initializing empty repository..."
 
-          mkdir -p /tmp/git-backup
+          # GitHub does not allow Git Database API writes such as
+          # blob creation while the repository has zero commits.
+          # Create a temporary initialization commit first.
+          INIT_CONTENT=$(printf '%s' "Temporary backup initialization" | base64 -w 0)
 
-          #
-          # Collect all reachable commits from every local branch.
-          #
-          git rev-list --all --objects > /tmp/git-backup/all-objects.txt
+          gh api \
+            --method PUT \
+            "repos/${OWNER}/${BACKUP_REPO}/contents/.backup-initialization" \
+            -f message="Initialize backup repository" \
+            -f content="${INIT_CONTENT}" \
+            > /tmp/init-response.json
 
-          OBJECT_COUNT=$(wc -l < /tmp/git-backup/all-objects.txt)
+          INIT_SHA=$(jq -r '.commit.sha' /tmp/init-response.json)
 
-          echo "Reachable objects listed: ${OBJECT_COUNT}"
-
-          #
-          # We use git cat-file to inspect the Git object database.
-          #
-          declare -A OBJECT_MAP
+          echo "Temporary initialization commit: ${INIT_SHA}"
 
           echo
-          echo "========================================"
-          echo "Uploading Git objects"
-          echo "========================================"
+          echo "Checking source Git repository..."
 
-          #
-          # Upload blobs first.
-          #
-          git rev-list --objects --all |
-          while read -r SHA PATHNAME; do
+          COMMIT_COUNT=$(git rev-list --all --count)
+          OBJECT_COUNT=$(git rev-list --objects --all | wc -l)
 
-            TYPE=$(git cat-file -t "${SHA}")
-
-            if [ "${TYPE}" != "blob" ]; then
-              continue
-            fi
-
-            SIZE=$(git cat-file -s "${SHA}")
-
-            echo "Blob ${SHA} (${SIZE} bytes)"
-
-            if [ "${SIZE}" -gt 100000000 ]; then
-              echo "ERROR: Blob ${SHA} is larger than GitHub's 100 MB API limit."
-              echo "If this repository uses Git LFS, LFS requires separate handling."
-              exit 1
-            fi
-
-            CONTENT_FILE="/tmp/git-backup/blob-${SHA}"
-
-            git cat-file blob "${SHA}" > "${CONTENT_FILE}"
-
-            BASE64_CONTENT=$(base64 -w 0 "${CONTENT_FILE}")
-
-            NEW_SHA=$(gh api \
-              --method POST \
-              "repos/${OWNER}/${BACKUP_REPO}/git/blobs" \
-              -f content="${BASE64_CONTENT}" \
-              -f encoding="base64" \
-              --jq '.sha')
-
-            if [ "${NEW_SHA}" != "${SHA}" ]; then
-              echo "ERROR: Blob SHA changed."
-              echo "Source : ${SHA}"
-              echo "Backup : ${NEW_SHA}"
-              exit 1
-            fi
-
-          done
+          echo "Source commits : ${COMMIT_COUNT}"
+          echo "Source objects : ${OBJECT_COUNT}"
 
           echo
-          echo "All blobs uploaded."
+          echo "Checking for Git LFS..."
 
-          echo
-          echo "========================================"
-          echo "Recreating trees and commits"
-          echo "========================================"
-
-          #
-          # Create a temporary mapping database.
-          #
-          rm -f /tmp/git-backup/object-map.txt
-
-          #
-          # Process commits from oldest to newest.
-          #
-          git rev-list --all --topo-order --reverse |
-          while read -r COMMIT; do
-
-            echo
-            echo "Processing commit:"
-            echo "${COMMIT}"
-
-            TREE=$(git rev-parse "${COMMIT}^{tree}")
-
-            echo "Tree: ${TREE}"
-
-            #
-            # Create tree recursively using GitHub's Git Trees API.
-            #
-            TREE_JSON="/tmp/git-backup/tree-${TREE}.json"
-
-            if [ ! -f "${TREE_JSON}" ]; then
-
-              git ls-tree -r -z "${TREE}" > "/tmp/git-backup/tree-${TREE}.raw"
-
-              python3 - \
-                "${TREE}" \
-                "${OWNER}" \
-                "${BACKUP_REPO}" \
-                "${TREE_JSON}" <<'PY'
-          import sys
-          import subprocess
-          import json
-          import base64
-
-          tree_sha = sys.argv[1]
-          owner = sys.argv[2]
-          repo = sys.argv[3]
-          output = sys.argv[4]
-
-          raw = open(f"/tmp/git-backup/tree-{tree_sha}.raw", "rb").read()
-
-          entries = []
-
-          for item in raw.split(b"\0"):
-              if not item:
-                  continue
-
-              header, pathname = item.split(b"\t", 1)
-
-              mode, sha = header.decode().split(" ", 1)
-
-              entries.append({
-                  "path": pathname.decode("utf-8", errors="surrogateescape"),
-                  "mode": mode,
-                  "type": "blob",
-                  "sha": sha
-              })
-
-          with open(output, "w") as f:
-              json.dump(entries, f)
-          PY
-
-              TREE_ENTRIES=$(cat "${TREE_JSON}")
-
-              NEW_TREE=$(gh api \
-                --method POST \
-                "repos/${OWNER}/${BACKUP_REPO}/git/trees" \
-                -f tree="${TREE_ENTRIES}" \
-                --jq '.sha')
-
-              echo "${TREE}:${NEW_TREE}" >> /tmp/git-backup/tree-map.txt
-
+          if git lfs version >/dev/null 2>&1; then
+            if git lfs ls-files --all 2>/dev/null | grep -q .; then
+              echo
+              echo "WARNING: Git LFS files were detected."
+              echo "The Git LFS pointer files will be backed up,"
+              echo "but the separate LFS objects are not copied by this API workflow."
+              echo
             else
-
-              NEW_TREE=$(grep "^${TREE}:" /tmp/git-backup/tree-map.txt | tail -1 | cut -d: -f2)
-
+              echo "No Git LFS files detected."
             fi
-
-            #
-            # Read original commit metadata.
-            #
-            MESSAGE=$(git log -1 --format=%B "${COMMIT}")
-
-            AUTHOR_NAME=$(git log -1 --format=%an "${COMMIT}")
-            AUTHOR_EMAIL=$(git log -1 --format=%ae "${COMMIT}")
-            AUTHOR_DATE=$(git log -1 --format=%aI "${COMMIT}")
-
-            COMMITTER_NAME=$(git log -1 --format=%cn "${COMMIT}")
-            COMMITTER_EMAIL=$(git log -1 --format=%ce "${COMMIT}")
-            COMMITTER_DATE=$(git log -1 --format=%cI "${COMMIT}")
-
-            PARENTS=$(git rev-list --parents -n 1 "${COMMIT}")
-
-            PARENT_ARGS=()
-
-            for PARENT in ${PARENTS}; do
-              if [ "${PARENT}" = "${COMMIT}" ]; then
-                continue
-              fi
-
-              PARENT_ARGS+=(--arg "parent" "${PARENT}")
-            done
-
-            #
-            # Build commit JSON.
-            #
-            COMMIT_JSON="/tmp/git-backup/commit-${COMMIT}.json"
-
-            python3 - \
-              "${COMMIT}" \
-              "${NEW_TREE}" \
-              "${MESSAGE}" \
-              "${AUTHOR_NAME}" \
-              "${AUTHOR_EMAIL}" \
-              "${AUTHOR_DATE}" \
-              "${COMMITTER_NAME}" \
-              "${COMMITTER_EMAIL}" \
-              "${COMMITTER_DATE}" \
-              "${OWNER}" \
-              "${BACKUP_REPO}" \
-              "${COMMIT_JSON}" <<'PY'
-          import sys
-          import json
-
-          (
-              original,
-              tree,
-              message,
-              author_name,
-              author_email,
-              author_date,
-              committer_name,
-              committer_email,
-              committer_date,
-              owner,
-              repo,
-              output
-          ) = sys.argv[1:]
-
-          data = {
-              "message": message,
-              "tree": tree,
-              "author": {
-                  "name": author_name,
-                  "email": author_email,
-                  "date": author_date
-              },
-              "committer": {
-                  "name": committer_name,
-                  "email": committer_email,
-                  "date": committer_date
-              }
-          }
-
-          with open(output, "w") as f:
-              json.dump(data, f)
-          PY
-
-            #
-            # Add parents.
-            #
-            PARENT_JSON=$(git rev-list --parents -n 1 "${COMMIT}" | cut -d' ' -f2-)
-
-            if [ -n "${PARENT_JSON}" ]; then
-              python3 - \
-                "${COMMIT_JSON}" \
-                "${PARENT_JSON}" <<'PY'
-          import sys
-          import json
-
-          filename = sys.argv[1]
-          parents = sys.argv[2:]
-
-          data = json.load(open(filename))
-          data["parents"] = parents
-
-          with open(filename, "w") as f:
-              json.dump(data, f)
-          PY
-            fi
-
-            NEW_COMMIT=$(gh api \
-              --method POST \
-              "repos/${OWNER}/${BACKUP_REPO}/git/commits" \
-              --input "${COMMIT_JSON}" \
-              --jq '.sha')
-
-            echo "Created commit: ${NEW_COMMIT}"
-
-            #
-            # Save source -> destination commit mapping.
-            #
-            echo "${COMMIT}:${NEW_COMMIT}" >> /tmp/git-backup/commit-map.txt
-
-          done
-
-          echo
-          echo "========================================"
-          echo "Restoring branches"
-          echo "========================================"
-
-          git for-each-ref \
-            --format='%(refname) %(objectname)' \
-            refs/remotes/origin |
-          while read -r REF SHA; do
-
-            BRANCH="${REF#refs/remotes/origin/}"
-
-            if [ "${BRANCH}" = "HEAD" ]; then
-              continue
-            fi
-
-            DEST=$(grep "^${SHA}:" /tmp/git-backup/commit-map.txt | tail -1 | cut -d: -f2)
-
-            if [ -z "${DEST}" ]; then
-              echo "WARNING: Could not map branch ${BRANCH}"
-              continue
-            fi
-
-            echo "Branch: ${BRANCH} -> ${DEST}"
-
-            gh api \
-              --method POST \
-              "repos/${OWNER}/${BACKUP_REPO}/git/refs" \
-              -f ref="refs/heads/${BRANCH}" \
-              -f sha="${DEST}"
-
-          done
-
-          #
-          # Also make sure main exists.
-          #
-          MAIN_SHA=$(git rev-parse refs/remotes/origin/main)
-
-          MAIN_DEST=$(grep "^${MAIN_SHA}:" /tmp/git-backup/commit-map.txt | tail -1 | cut -d: -f2)
-
-          if [ -n "${MAIN_DEST}" ]; then
-
-            gh api \
-              --method PATCH \
-              "repos/${OWNER}/${BACKUP_REPO}/git/refs/heads/main" \
-              -f sha="${MAIN_DEST}" \
-              -F force=true
-
+          else
+            echo "Git LFS is not installed."
           fi
 
           echo
           echo "========================================"
-          echo "Restoring tags"
+          echo "Starting Git Database migration"
           echo "========================================"
 
-          git for-each-ref \
-            --format='%(refname) %(objectname) %(objecttype)' \
-            refs/tags |
-          while read -r REF SHA TYPE; do
+          python3 <<'PY'
+          import base64
+          import json
+          import os
+          import subprocess
+          import sys
+          import tempfile
+          import time
+          from pathlib import Path
 
-            TAG="${REF#refs/tags/}"
 
-            echo "Tag: ${TAG}"
+          OWNER = "ARJUNC0DER"
+          REPO = os.environ["BACKUP_REPO"]
+          WORK = Path("/tmp/github-git-backup")
 
-            if [ "${TYPE}" = "commit" ]; then
+          WORK.mkdir(parents=True, exist_ok=True)
 
-              DEST=$(grep "^${SHA}:" /tmp/git-backup/commit-map.txt | tail -1 | cut -d: -f2)
+          # GitHub has secondary limits on content-generating API requests.
+          # Keeping a small delay makes the migration much less likely to
+          # hit those limits.
+          WRITE_DELAY = 0.85
 
-              if [ -z "${DEST}" ]; then
-                echo "WARNING: Could not map tag ${TAG}"
-                continue
-              fi
 
-              gh api \
-                --method POST \
-                "repos/${OWNER}/${BACKUP_REPO}/git/refs" \
-                -f ref="refs/tags/${TAG}" \
-                -f sha="${DEST}"
+          def run(command, input_data=None):
+              result = subprocess.run(
+                  command,
+                  input=input_data,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  check=False
+              )
 
-            else
+              if result.returncode != 0:
+                  print("COMMAND FAILED:")
+                  print(" ".join(command))
+                  print(result.stderr.decode("utf-8", errors="replace"))
+                  raise RuntimeError("Command failed")
 
-              echo "Annotated tag detected: ${TAG}"
+              return result.stdout
 
-              TAG_MESSAGE=$(git for-each-ref \
-                --format='%(contents)' \
-                "${REF}")
 
-              TAGGER_NAME=$(git for-each-ref \
-                --format='%(taggername)' \
-                "${REF}")
+          def git(*args):
+              return run(["git", *args]).decode("utf-8", errors="replace")
 
-              TAGGER_EMAIL=$(git for-each-ref \
-                --format='%(taggeremail)' \
-                "${REF}")
 
-              TAGGER_DATE=$(git for-each-ref \
-                --format='%(taggerdate:iso-strict)' \
-                "${REF}")
+          def git_bytes(*args):
+              return run(["git", *args])
 
-              TARGET=$(git rev-parse "${REF}^{}")
 
-              DEST=$(grep "^${TARGET}:" /tmp/git-backup/commit-map.txt | tail -1 | cut -d: -f2)
+          def api_write(method, endpoint, payload):
+              """
+              Write JSON through gh api.
 
-              if [ -z "${DEST}" ]; then
-                echo "WARNING: Could not map annotated tag ${TAG}"
-                continue
-              fi
+              Retries are included for GitHub transient/secondary limits.
+              """
 
-              TAG_SHA=$(gh api \
-                --method POST \
-                "repos/${OWNER}/${BACKUP_REPO}/git/tags" \
-                -f tag="${TAG}" \
-                -f message="${TAG_MESSAGE}" \
-                -f object="${DEST}" \
-                -f type="commit" \
-                -f "tagger[name]=${TAGGER_NAME}" \
-                -f "tagger[email]=${TAGGER_EMAIL}" \
-                -f "tagger[date]=${TAGGER_DATE}" \
-                --jq '.sha')
+              payload_file = WORK / "request.json"
 
-              gh api \
-                --method POST \
-                "repos/${OWNER}/${BACKUP_REPO}/git/refs" \
-                -f ref="refs/tags/${TAG}" \
-                -f sha="${TAG_SHA}"
+              with payload_file.open("w", encoding="utf-8") as f:
+                  json.dump(
+                      payload,
+                      f,
+                      ensure_ascii=False,
+                      separators=(",", ":")
+                  )
 
-            fi
+              last_error = None
 
-          done
+              for attempt in range(1, 7):
+                  command = [
+                      "gh",
+                      "api",
+                      "--method",
+                      method,
+                      endpoint,
+                      "--input",
+                      str(payload_file)
+                  ]
 
-          echo
+                  result = subprocess.run(
+                      command,
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.PIPE,
+                      check=False
+                  )
+
+                  if result.returncode == 0:
+                      time.sleep(WRITE_DELAY)
+
+                      text = result.stdout.decode(
+                          "utf-8",
+                          errors="replace"
+                      )
+
+                      if not text.strip():
+                          return {}
+
+                      return json.loads(text)
+
+                  last_error = result.stderr.decode(
+                      "utf-8",
+                      errors="replace"
+                  )
+
+                  print(
+                      f"GitHub API write failed "
+                      f"(attempt {attempt}/6):"
+                  )
+                  print(last_error)
+
+                  # Exponential backoff.
+                  time.sleep(min(60, 3 * attempt))
+
+              raise RuntimeError(
+                  f"GitHub API request failed permanently: {last_error}"
+              )
+
+
+          def api_post(endpoint, payload):
+              return api_write("POST", endpoint, payload)
+
+
+          def get_blob_source(sha):
+              """
+              Return the raw bytes of a local Git blob.
+              """
+              return git_bytes("cat-file", "blob", sha)
+
+
+          def object_type(sha):
+              return git(
+                  "cat-file",
+                  "-t",
+                  sha
+              ).strip()
+
+
+          def create_blob(source_sha):
+              """
+              Upload one Git blob to GitHub.
+
+              GitHub's normal repository file limit is 100 MiB.
+              """
+              cache_file = WORK / "blob-map.json"
+
+              if cache_file.exists():
+                  with cache_file.open(
+                      "r",
+                      encoding="utf-8"
+                  ) as f:
+                      cache = json.load(f)
+              else:
+                  cache = {}
+
+              if source_sha in cache:
+                  return cache[source_sha]
+
+              data = get_blob_source(source_sha)
+
+              size = len(data)
+
+              print(
+                  f"Uploading blob "
+                  f"{source_sha} "
+                  f"({size} bytes)"
+              )
+
+              if size > 100 * 1024 * 1024:
+                  raise RuntimeError(
+                      f"Blob {source_sha} is larger than "
+                      f"100 MiB. GitHub blocks files above "
+                      f"100 MiB in normal Git repositories."
+                  )
+
+              encoded = base64.b64encode(data).decode("ascii")
+
+              result = api_post(
+                  f"repos/{OWNER}/{REPO}/git/blobs",
+                  {
+                      "content": encoded,
+                      "encoding": "base64"
+                  }
+              )
+
+              destination_sha = result["sha"]
+
+              if destination_sha != source_sha:
+                  raise RuntimeError(
+                      "Blob SHA mismatch.\n"
+                      f"Source      : {source_sha}\n"
+                      f"Destination : {destination_sha}"
+                  )
+
+              cache[source_sha] = destination_sha
+
+              with cache_file.open(
+                  "w",
+                  encoding="utf-8"
+              ) as f:
+                  json.dump(cache, f)
+
+              return destination_sha
+
+
+          print()
+          print("========================================")
+          print("Collecting Git objects")
+          print("========================================")
+
+
+          # Get every object reachable from every branch/tag.
+          object_lines = git(
+              "rev-list",
+              "--objects",
+              "--all"
+          ).splitlines()
+
+          all_objects = []
+
+          for line in object_lines:
+              parts = line.split(" ", 1)
+              sha = parts[0]
+
+              if sha not in all_objects:
+                  all_objects.append(sha)
+
+          print(
+              f"Reachable Git objects: {len(all_objects)}"
+          )
+
+
+          print()
+          print("========================================")
+          print("Uploading blobs")
+          print("========================================")
+
+
+          blob_objects = []
+
+          for sha in all_objects:
+              if object_type(sha) == "blob":
+                  blob_objects.append(sha)
+
+          print(
+              f"Unique blobs to upload: "
+              f"{len(blob_objects)}"
+          )
+
+
+          for index, sha in enumerate(
+              blob_objects,
+              start=1
+          ):
+              print(
+                  f"[{index}/{len(blob_objects)}] "
+                  f"Blob {sha}"
+              )
+
+              create_blob(sha)
+
+
+          print()
+          print("All blobs uploaded successfully.")
+
+
+          print()
+          print("========================================")
+          print("Collecting commits")
+          print("========================================")
+
+
+          commit_lines = git(
+              "rev-list",
+              "--all",
+              "--topo-order",
+              "--reverse"
+          ).splitlines()
+
+          commits = []
+
+          for sha in commit_lines:
+              if sha not in commits:
+                  commits.append(sha)
+
+          print(
+              f"Unique commits to recreate: "
+              f"{len(commits)}"
+          )
+
+
+          # Map source tree SHA -> destination tree SHA.
+          tree_map = {}
+
+          # Map source commit SHA -> destination commit SHA.
+          commit_map = {}
+
+
+          def get_tree_entries(tree_sha):
+              """
+              Get all leaf entries in a Git tree.
+
+              The GitHub Trees API accepts nested paths, so a
+              recursive ls-tree can be sent as a flat list of
+              paths and GitHub reconstructs the directory tree.
+              """
+
+              raw = git_bytes(
+                  "ls-tree",
+                  "-r",
+                  "-z",
+                  "--full-tree",
+                  tree_sha
+              )
+
+              entries = []
+
+              for item in raw.split(b"\0"):
+                  if not item:
+                      continue
+
+                  header, pathname = item.split(
+                      b"\t",
+                      1
+                  )
+
+                  parts = header.decode(
+                      "utf-8"
+                  ).split(" ")
+
+                  mode = parts[0]
+                  entry_type = parts[1]
+                  sha = parts[2]
+
+                  # GitHub expects UTF-8 paths.
+                  path = pathname.decode(
+                      "utf-8"
+                  )
+
+                  if entry_type == "blob":
+                      api_type = "blob"
+                  elif entry_type == "commit":
+                      # Git submodule/gitlink.
+                      api_type = "commit"
+                  else:
+                      raise RuntimeError(
+                          f"Unexpected tree entry type: "
+                          f"{entry_type}"
+                      )
+
+                  entries.append(
+                      {
+                          "path": path,
+                          "mode": mode,
+                          "type": api_type,
+                          "sha": sha
+                      }
+                  )
+
+              return entries
+
+
+          def create_tree(source_tree_sha):
+              """
+              Recreate a complete root tree.
+              """
+
+              if source_tree_sha in tree_map:
+                  return tree_map[source_tree_sha]
+
+              print(
+                  f"Creating tree "
+                  f"{source_tree_sha}"
+              )
+
+              entries = get_tree_entries(
+                  source_tree_sha
+              )
+
+              # Verify that every blob referenced by the tree
+              # has already been uploaded.
+              for entry in entries:
+                  if entry["type"] == "blob":
+                      # The source and destination blob SHA must
+                      # remain identical.
+                      pass
+
+              payload = {
+                  "tree": entries
+              }
+
+              result = api_post(
+                  f"repos/{OWNER}/{REPO}/git/trees",
+                  payload
+              )
+
+              destination_tree_sha = result["sha"]
+
+              # If all objects and paths are identical, Git's
+              # content-addressed tree SHA should also be identical.
+              if destination_tree_sha != source_tree_sha:
+                  raise RuntimeError(
+                      "Tree SHA mismatch.\n"
+                      f"Source      : {source_tree_sha}\n"
+                      f"Destination : {destination_tree_sha}\n"
+                      "\n"
+                      "The source tree could not be reproduced "
+                      "byte-for-byte."
+                  )
+
+              tree_map[source_tree_sha] = (
+                  destination_tree_sha
+              )
+
+              return destination_tree_sha
+
+
+          print()
+          print("========================================")
+          print("Recreating commits")
+          print("========================================")
+
+
+          for index, commit_sha in enumerate(
+              commits,
+              start=1
+          ):
+
+              print()
+              print(
+                  f"[{index}/{len(commits)}] "
+                  f"Commit {commit_sha}"
+              )
+
+              raw_commit = git_bytes(
+                  "cat-file",
+                  "commit",
+                  commit_sha
+              ).decode(
+                  "utf-8",
+                  errors="replace"
+              )
+
+              # The REST API can reproduce normal commit objects.
+              # A signed commit contains a gpgsig header and can
+              # require additional signature handling.
+              if "\ngpgsig " in raw_commit:
+                  raise RuntimeError(
+                      f"Commit {commit_sha} is GPG signed. "
+                      "The automated API backup has stopped instead "
+                      "of silently creating a different commit SHA."
+                  )
+
+              if "\nmergetag " in raw_commit:
+                  raise RuntimeError(
+                      f"Commit {commit_sha} contains a mergetag "
+                      "header. The automated API backup has stopped "
+                      "instead of silently changing commit metadata."
+                  )
+
+              tree_sha = git(
+                  "rev-parse",
+                  f"{commit_sha}^{{tree}}"
+              ).strip()
+
+              destination_tree_sha = create_tree(
+                  tree_sha
+              )
+
+              parents = git(
+                  "rev-list",
+                  "--parents",
+                  "-n",
+                  "1",
+                  commit_sha
+              ).strip().split()
+
+              source_parents = parents[1:]
+
+              # Parents must already have been recreated.
+              destination_parents = []
+
+              for parent in source_parents:
+                  if parent not in commit_map:
+                      raise RuntimeError(
+                          f"Parent commit {parent} "
+                          f"has not been recreated before "
+                          f"child {commit_sha}."
+                      )
+
+                  destination_parents.append(
+                      commit_map[parent]
+                  )
+
+              author_name = git(
+                  "show",
+                  "-s",
+                  "--format=%an",
+                  commit_sha
+              ).rstrip("\n")
+
+              author_email = git(
+                  "show",
+                  "-s",
+                  "--format=%ae",
+                  commit_sha
+              ).rstrip("\n")
+
+              author_date = git(
+                  "show",
+                  "-s",
+                  "--format=%aI",
+                  commit_sha
+              ).rstrip("\n")
+
+              committer_name = git(
+                  "show",
+                  "-s",
+                  "--format=%cn",
+                  commit_sha
+              ).rstrip("\n")
+
+              committer_email = git(
+                  "show",
+                  "-s",
+                  "--format=%ce",
+                  commit_sha
+              ).rstrip("\n")
+
+              committer_date = git(
+                  "show",
+                  "-s",
+                  "--format=%cI",
+                  commit_sha
+              ).rstrip("\n")
+
+              message = git_bytes(
+                  "show",
+                  "-s",
+                  "--format=%B",
+                  commit_sha
+              ).decode(
+                  "utf-8",
+                  errors="replace"
+              )
+
+              payload = {
+                  "message": message,
+                  "tree": destination_tree_sha,
+                  "author": {
+                      "name": author_name,
+                      "email": author_email,
+                      "date": author_date
+                  },
+                  "committer": {
+                      "name": committer_name,
+                      "email": committer_email,
+                      "date": committer_date
+                  },
+                  "parents": destination_parents
+              }
+
+              result = api_post(
+                  f"repos/{OWNER}/{REPO}/git/commits",
+                  payload
+              )
+
+              destination_commit_sha = result["sha"]
+
+              print(
+                  f"Source commit      : "
+                  f"{commit_sha}"
+              )
+
+              print(
+                  f"Backup commit      : "
+                  f"{destination_commit_sha}"
+              )
+
+              if destination_commit_sha != commit_sha:
+                  raise RuntimeError(
+                      "\nCOMMIT SHA MISMATCH\n"
+                      f"Source      : {commit_sha}\n"
+                      f"Destination : {destination_commit_sha}\n"
+                      "\n"
+                      "The backup stopped because the commit "
+                      "could not be reproduced exactly."
+                  )
+
+              commit_map[commit_sha] = (
+                  destination_commit_sha
+              )
+
+
+          print()
+          print("All commits recreated successfully.")
+
+
+          print()
+          print("========================================")
+          print("Restoring branches")
+          print("========================================")
+
+
+          branch_lines = git(
+              "for-each-ref",
+              "--format=%(refname:strip=3)%00%(objectname)",
+              "refs/remotes/origin"
+          ).splitlines()
+
+          for line in branch_lines:
+
+              if "\0" not in line:
+                  continue
+
+              branch, source_sha = line.split(
+                  "\0",
+                  1
+              )
+
+              if branch == "HEAD":
+                  continue
+
+              if source_sha not in commit_map:
+                  raise RuntimeError(
+                      f"Branch {branch} points to "
+                      f"unknown commit {source_sha}"
+                  )
+
+              destination_sha = commit_map[
+                  source_sha
+              ]
+
+              print(
+                  f"Branch {branch} -> "
+                  f"{destination_sha}"
+              )
+
+              api_post(
+                  f"repos/{OWNER}/{REPO}/git/refs",
+                  {
+                      "ref": f"refs/heads/{branch}",
+                      "sha": destination_sha
+                  }
+              )
+
+
+          print()
+          print("All branches restored.")
+
+
+          print()
+          print("========================================")
+          print("Restoring tags")
+          print("========================================")
+
+
+          tag_refs = git(
+              "for-each-ref",
+              "--format=%(refname)%00%(objectname)%00%(objecttype)",
+              "refs/tags"
+          ).splitlines()
+
+
+          for line in tag_refs:
+
+              parts = line.split("\0")
+
+              if len(parts) != 3:
+                  continue
+
+              refname, source_sha, source_type = parts
+
+              tag_name = refname[
+                  len("refs/tags/"):
+              ]
+
+              print(
+                  f"Tag {tag_name}"
+              )
+
+              if source_type == "commit":
+
+                  if source_sha not in commit_map:
+                      raise RuntimeError(
+                          f"Tag {tag_name} points to "
+                          f"unknown commit {source_sha}"
+                      )
+
+                  destination_sha = commit_map[
+                      source_sha
+                  ]
+
+                  # Lightweight tag.
+                  api_post(
+                      f"repos/{OWNER}/{REPO}/git/refs",
+                      {
+                          "ref": f"refs/tags/{tag_name}",
+                          "sha": destination_sha
+                      }
+                  )
+
+              elif source_type == "tag":
+
+                  # Annotated tag.
+                  raw_tag = git(
+                      "cat-file",
+                      "tag",
+                      source_sha
+                  )
+
+                  if "-----BEGIN PGP SIGNATURE-----" in raw_tag:
+                      raise RuntimeError(
+                          f"Annotated tag {tag_name} is PGP signed. "
+                          "The API workflow stopped rather than "
+                          "silently changing the tag object."
+                      )
+
+                  target_sha = git(
+                      "rev-parse",
+                      f"{refname}^{{}}"
+                  ).strip()
+
+                  if target_sha not in commit_map:
+                      raise RuntimeError(
+                          f"Annotated tag {tag_name} target "
+                          f"{target_sha} was not recreated."
+                      )
+
+                  destination_target = commit_map[
+                      target_sha
+                  ]
+
+                  tag_name_header = None
+                  tagger_name = None
+                  tagger_email = None
+                  tagger_date = None
+
+                  lines = raw_tag.splitlines()
+
+                  message_start = False
+                  message_lines = []
+
+                  for raw_line in lines:
+
+                      if raw_line.startswith(
+                          "tag "
+                      ):
+                          tag_name_header = raw_line[
+                              4:
+                          ]
+
+                      elif raw_line.startswith(
+                          "tagger "
+                      ):
+                          value = raw_line[
+                              len("tagger "):
+                          ]
+
+                          # Parse:
+                          # Name <email> timestamp
+                          import re
+
+                          match = re.match(
+                              r"^(.*) <([^>]+)> (.*)$",
+                              value
+                          )
+
+                          if not match:
+                              raise RuntimeError(
+                                  f"Could not parse tagger "
+                                  f"for tag {tag_name}"
+                              )
+
+                          tagger_name = match.group(1)
+                          tagger_email = match.group(2)
+                          tagger_date = match.group(3)
+
+                      elif raw_line == "":
+                          message_start = True
+
+                      elif message_start:
+                          message_lines.append(
+                              raw_line
+                          )
+
+                  if tag_name_header is None:
+                      tag_name_header = tag_name
+
+                  tag_message = "\n".join(
+                      message_lines
+                  )
+
+                  api_result = api_post(
+                      f"repos/{OWNER}/{REPO}/git/tags",
+                      {
+                          "tag": tag_name_header,
+                          "message": tag_message,
+                          "object": destination_target,
+                          "type": "commit",
+                          "tagger": {
+                              "name": tagger_name,
+                              "email": tagger_email,
+                              "date": tagger_date
+                          }
+                      }
+                  )
+
+                  destination_tag_sha = api_result[
+                      "sha"
+                  ]
+
+                  api_post(
+                      f"repos/{OWNER}/{REPO}/git/refs",
+                      {
+                          "ref": f"refs/tags/{tag_name}",
+                          "sha": destination_tag_sha
+                      }
+                  )
+
+              else:
+                  raise RuntimeError(
+                      f"Unsupported tag object type: "
+                      f"{source_type}"
+                  )
+
+
+          print()
+          print("All tags restored.")
+
+
+          print()
+          print("========================================")
+          print("VERIFYING BACKUP")
+          print("========================================")
+
+
+          source_main = git(
+              "rev-parse",
+              "refs/remotes/origin/main"
+          ).strip()
+
+          destination_main = subprocess.check_output(
+              [
+                  "gh",
+                  "api",
+                  f"repos/{OWNER}/{REPO}/git/ref/heads/main",
+                  "--jq",
+                  ".object.sha"
+              ],
+              text=True
+          ).strip()
+
+          print(
+              f"Source main   : {source_main}"
+          )
+
+          print(
+              f"Backup main   : {destination_main}"
+          )
+
+          if source_main != destination_main:
+              raise RuntimeError(
+                  "FINAL VERIFICATION FAILED: "
+                  "main does not point to the same commit."
+              )
+
+
+          source_branches = set()
+
+          for line in branch_lines:
+
+              if "\0" not in line:
+                  continue
+
+              branch, _ = line.split(
+                  "\0",
+                  1
+              )
+
+              if branch != "HEAD":
+                  source_branches.add(branch)
+
+
+          backup_branches = set()
+
+          page = 1
+
+          while True:
+
+              output = subprocess.check_output(
+                  [
+                      "gh",
+                      "api",
+                      f"repos/{OWNER}/{REPO}/branches"
+                      f"?per_page=100&page={page}"
+                  ],
+                  text=True
+              )
+
+              data = json.loads(output)
+
+              if not data:
+                  break
+
+              for branch in data:
+                  backup_branches.add(
+                      branch["name"]
+                  )
+
+              if len(data) < 100:
+                  break
+
+              page += 1
+
+
+          print(
+              f"Source branches : "
+              f"{len(source_branches)}"
+          )
+
+          print(
+              f"Backup branches : "
+              f"{len(backup_branches)}"
+          )
+
+
+          missing_branches = (
+              source_branches -
+              backup_branches
+          )
+
+          if missing_branches:
+              raise RuntimeError(
+                  "Missing backup branches: "
+                  + ", ".join(
+                      sorted(missing_branches)
+                  )
+              )
+
+
+          print()
+          print("========================================")
+          print("BACKUP COMPLETED SUCCESSFULLY")
+          print("========================================")
+          print(
+              f"https://github.com/"
+              f"{OWNER}/{REPO}"
+          )
+          print("========================================")
+
+          PY
+        env:
+          BACKUP_REPO: ${{ env.BACKUP_REPO }}
+
+      - name: Final backup summary
+        if: success()
+        run: |
           echo "========================================"
-          echo "BACKUP COMPLETED"
+          echo "BACKUP SUCCESSFUL"
           echo "========================================"
-          echo "Backup repository:"
-          echo "https://github.com/${OWNER}/${BACKUP_REPO}"
+          echo "Source : HARSHITC0DER/java"
+          echo "Owner  : ARJUNC0DER"
+          echo "A new private backup repository was created."
           echo "========================================"
