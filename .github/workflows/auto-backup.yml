@@ -9,7 +9,6 @@ on:
 
 jobs:
   backup:
-    # Never run this workflow from a backup repository.
     if: github.repository == 'HARSHITC0DER/java'
 
     runs-on: ubuntu-latest
@@ -17,14 +16,15 @@ jobs:
     env:
       SOURCE_OWNER: HARSHITC0DER
       SOURCE_REPO: java
+
       BACKUP_OWNER: ARJUNC0DER
       BACKUP_TOKEN: ${{ secrets.BACKUP_TOKEN }}
 
-      # Slow down GitHub Git-Database writes to avoid
-      # secondary rate limits / anti-spam protection.
-      WRITE_DELAY: "1.5"
+      # Keep GitHub mutations slow and serial.
+      WRITE_DELAY: "2"
 
-      MAX_RETRIES: "8"
+      # Maximum retry count for temporary API failures.
+      MAX_RETRIES: "6"
 
     steps:
 
@@ -52,19 +52,25 @@ jobs:
             '+refs/tags/*:refs/tags/*' \
             --force
 
-          echo "Branches:"
+          echo "========================================"
+          echo "SOURCE BRANCHES"
+          echo "========================================"
+
           git for-each-ref \
-            --format='%(refname:short)' \
+            --format='%(refname:strip=3)' \
             refs/remotes/origin
 
           echo
-          echo "Tags:"
+          echo "========================================"
+          echo "SOURCE TAGS"
+          echo "========================================"
+
           git for-each-ref \
             --format='%(refname:short)' \
             refs/tags
 
       # ============================================================
-      # CREATE PRIVATE BACKUP REPOSITORY
+      # CREATE NEW PRIVATE BACKUP REPOSITORY
       # ============================================================
 
       - name: Create private backup repository
@@ -78,18 +84,23 @@ jobs:
 
           BACKUP_REPO="java-backup-${TIMESTAMP}"
 
-          echo "Creating:"
-          echo "${BACKUP_OWNER}/${BACKUP_REPO}"
+          echo "========================================"
+          echo "CREATING BACKUP REPOSITORY"
+          echo "========================================"
+
+          echo "Owner : ${BACKUP_OWNER}"
+          echo "Repo  : ${BACKUP_REPO}"
 
           gh repo create \
             "${BACKUP_OWNER}/${BACKUP_REPO}" \
             --private \
-            --description "Full private Git history backup of ${SOURCE_OWNER}/${SOURCE_REPO}"
+            --description \
+            "Full private Git history backup of ${SOURCE_OWNER}/${SOURCE_REPO}"
 
           echo "BACKUP_REPO=${BACKUP_REPO}" >> "$GITHUB_ENV"
 
           echo
-          echo "Backup repository created:"
+          echo "Created:"
           echo "https://github.com/${BACKUP_OWNER}/${BACKUP_REPO}"
 
       # ============================================================
@@ -103,12 +114,15 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "Initializing backup repository..."
+          echo "========================================"
+          echo "INITIALIZING BACKUP REPOSITORY"
+          echo "========================================"
 
-          printf 'Temporary initialization for Git Database migration.\n' \
-            > /tmp/backup-initialization.txt
+          printf '%s\n' \
+            'Temporary initialization for Git Database migration.' \
+            > /tmp/backup-init.txt
 
-          CONTENT="$(base64 -w 0 /tmp/backup-initialization.txt)"
+          CONTENT="$(base64 -w 0 /tmp/backup-init.txt)"
 
           gh api \
             --method PUT \
@@ -116,10 +130,10 @@ jobs:
             -f message="Initialize backup repository" \
             -f content="${CONTENT}"
 
-          echo "Repository initialized."
+          echo "Initialization complete."
 
       # ============================================================
-      # MIGRATE COMPLETE GIT DATABASE
+      # MIGRATE GIT DATABASE
       # ============================================================
 
       - name: Migrate complete Git history
@@ -136,16 +150,15 @@ jobs:
           python3 <<'PYTHON'
 
           import os
-          import sys
-          import time
           import json
+          import time
           import base64
           import subprocess
           from datetime import datetime, timezone
 
 
           # ==========================================================
-          # CONFIGURATION
+          # CONFIG
           # ==========================================================
 
           SOURCE_OWNER = os.environ["SOURCE_OWNER"]
@@ -157,16 +170,22 @@ jobs:
           TOKEN = os.environ["BACKUP_TOKEN"]
 
           WRITE_DELAY = float(
-              os.environ.get("WRITE_DELAY", "1.5")
+              os.environ.get(
+                  "WRITE_DELAY",
+                  "2"
+              )
           )
 
           MAX_RETRIES = int(
-              os.environ.get("MAX_RETRIES", "8")
+              os.environ.get(
+                  "MAX_RETRIES",
+                  "6"
+              )
           )
 
-          API_VERSION = "2026-03-10"
-
           API_BASE = "https://api.github.com"
+
+          API_VERSION = "2026-03-10"
 
           HEADERS = [
               "-H",
@@ -181,10 +200,13 @@ jobs:
 
 
           # ==========================================================
-          # GIT COMMAND
+          # GIT
           # ==========================================================
 
-          def git_command(*args, raw=False):
+          def git(
+              *args,
+              raw=False
+          ):
 
               result = subprocess.run(
                   ["git", *args],
@@ -203,345 +225,7 @@ jobs:
 
 
           # ==========================================================
-          # GITHUB API
-          # ==========================================================
-
-          def github_api(
-              method,
-              endpoint,
-              payload=None,
-              write=True
-          ):
-
-              url = API_BASE + endpoint
-
-              for attempt in range(1, MAX_RETRIES + 1):
-
-                  command = [
-                      "curl",
-                      "-sS",
-                      "-L",
-                      "-X",
-                      method,
-                      *HEADERS,
-                      "-w",
-                      "\n__HTTP_STATUS__:%{http_code}\n",
-                  ]
-
-                  if payload is not None:
-
-                      command.extend([
-                          "-H",
-                          "Content-Type: application/json",
-                          "--data",
-                          json.dumps(
-                              payload,
-                              separators=(",", ":")
-                          )
-                      ])
-
-                  command.append(url)
-
-                  result = subprocess.run(
-                      command,
-                      stdout=subprocess.PIPE,
-                      stderr=subprocess.PIPE,
-                      text=True
-                  )
-
-                  if result.returncode != 0:
-
-                      if attempt >= MAX_RETRIES:
-
-                          raise RuntimeError(
-                              "curl failed:\n"
-                              + result.stderr
-                          )
-
-                      wait = min(
-                          120,
-                          5 * (2 ** (attempt - 1))
-                      )
-
-                      print(
-                          f"curl failed. "
-                          f"Retrying in {wait}s..."
-                      )
-
-                      time.sleep(wait)
-
-                      continue
-
-                  output = result.stdout
-
-                  marker = "\n__HTTP_STATUS__:"
-
-                  if marker not in output:
-
-                      if attempt >= MAX_RETRIES:
-
-                          raise RuntimeError(
-                              "Unexpected GitHub response:\n"
-                              + output
-                          )
-
-                      time.sleep(
-                          min(
-                              120,
-                              5 * (2 ** (attempt - 1))
-                          )
-                      )
-
-                      continue
-
-                  body, status_text = output.rsplit(
-                      marker,
-                      1
-                  )
-
-                  status = int(
-                      status_text.strip()
-                  )
-
-                  try:
-                      data = (
-                          json.loads(body)
-                          if body.strip()
-                          else {}
-                      )
-                  except Exception:
-                      data = {
-                          "raw": body
-                      }
-
-                  # --------------------------------------------------
-                  # SUCCESS
-                  # --------------------------------------------------
-
-                  if 200 <= status < 300:
-
-                      if write:
-                          time.sleep(
-                              WRITE_DELAY
-                          )
-
-                      return data
-
-                  # --------------------------------------------------
-                  # TEMPORARY / RATE-LIMIT / VALIDATION RETRY
-                  # --------------------------------------------------
-
-                  message = ""
-
-                  if isinstance(data, dict):
-                      message = str(
-                          data.get(
-                              "message",
-                              ""
-                          )
-                      )
-
-                  retryable = status in (
-                      403,
-                      409,
-                      422,
-                      429,
-                      500,
-                      502,
-                      503,
-                      504
-                  )
-
-                  if retryable:
-
-                      if attempt >= MAX_RETRIES:
-
-                          raise RuntimeError(
-                              "\n"
-                              "GitHub API request failed.\n"
-                              f"HTTP: {status}\n"
-                              f"Endpoint: {endpoint}\n"
-                              f"Message: {message}\n"
-                              f"Response:\n"
-                              f"{json.dumps(data, indent=2)}"
-                          )
-
-                      wait = min(
-                          180,
-                          5 * (2 ** (attempt - 1))
-                      )
-
-                      print(
-                          f"GitHub API HTTP {status}"
-                      )
-
-                      print(
-                          f"Message: {message}"
-                      )
-
-                      print(
-                          f"Retry "
-                          f"{attempt}/{MAX_RETRIES} "
-                          f"in {wait}s..."
-                      )
-
-                      time.sleep(wait)
-
-                      continue
-
-                  # --------------------------------------------------
-                  # PERMANENT ERROR
-                  # --------------------------------------------------
-
-                  raise RuntimeError(
-                      "\n"
-                      "GitHub API error.\n"
-                      f"HTTP: {status}\n"
-                      f"Endpoint: {endpoint}\n"
-                      f"Message: {message}\n"
-                      f"Response:\n"
-                      f"{json.dumps(data, indent=2)}"
-                  )
-
-              raise RuntimeError(
-                  "GitHub API retry loop ended unexpectedly."
-              )
-
-
-          # ==========================================================
-          # ANALYZE SOURCE
-          # ==========================================================
-
-          print()
-          print("========================================")
-          print("ANALYZING SOURCE REPOSITORY")
-          print("========================================")
-
-          commits = git_command(
-              "rev-list",
-              "--all",
-              "--topo-order",
-              "--reverse"
-          ).splitlines()
-
-          commits = [
-              x.strip()
-              for x in commits
-              if x.strip()
-          ]
-
-          objects = git_command(
-              "rev-list",
-              "--objects",
-              "--all"
-          ).splitlines()
-
-          print(
-              f"Commits : {len(commits)}"
-          )
-
-          print(
-              f"Objects : {len(objects)}"
-          )
-
-
-          # ==========================================================
-          # FIND BLOBS
-          # ==========================================================
-
-          print()
-          print("========================================")
-          print("UPLOADING BLOBS")
-          print("========================================")
-
-          blobs = []
-
-          for line in objects:
-
-              sha = line.split(
-                  " ",
-                  1
-              )[0]
-
-              try:
-
-                  object_type = git_command(
-                      "cat-file",
-                      "-t",
-                      sha
-                  ).strip()
-
-              except Exception:
-
-                  continue
-
-              if object_type == "blob":
-                  blobs.append(sha)
-
-          blobs = list(
-              dict.fromkeys(blobs)
-          )
-
-          print(
-              f"Blobs found: {len(blobs)}"
-          )
-
-
-          # ==========================================================
-          # UPLOAD BLOBS
-          # ==========================================================
-
-          for index, sha in enumerate(
-              blobs,
-              1
-          ):
-
-              content = git_command(
-                  "cat-file",
-                  "blob",
-                  sha,
-                  raw=True
-              )
-
-              encoded = base64.b64encode(
-                  content
-              ).decode("ascii")
-
-              print(
-                  f"[{index}/{len(blobs)}] "
-                  f"Blob {sha} "
-                  f"({len(content)} bytes)"
-              )
-
-              response = github_api(
-                  "POST",
-                  f"/repos/{BACKUP_OWNER}/{BACKUP_REPO}/git/blobs",
-                  {
-                      "content": encoded,
-                      "encoding": "base64"
-                  }
-              )
-
-              remote_sha = response.get(
-                  "sha"
-              )
-
-              if remote_sha != sha:
-
-                  raise RuntimeError(
-                      "\nBLOB SHA MISMATCH\n"
-                      f"Source : {sha}\n"
-                      f"Remote : {remote_sha}"
-                  )
-
-          print()
-          print(
-              "All blobs uploaded successfully."
-          )
-
-
-          # ==========================================================
-          # DATE HELPERS
+          # DATE
           # ==========================================================
 
           def timezone_to_seconds(value):
@@ -567,14 +251,10 @@ jobs:
               timezone_value
           ):
 
-              timestamp = int(
-                  timestamp
-              )
+              timestamp = int(timestamp)
 
-              offset_seconds = (
-                  timezone_to_seconds(
-                      timezone_value
-                  )
+              offset = timezone_to_seconds(
+                  timezone_value
               )
 
               dt = datetime.fromtimestamp(
@@ -582,15 +262,9 @@ jobs:
                   timezone.utc
               )
 
-              sign = (
-                  "+"
-                  if offset_seconds >= 0
-                  else "-"
-              )
+              sign = "+" if offset >= 0 else "-"
 
-              absolute = abs(
-                  offset_seconds
-              )
+              absolute = abs(offset)
 
               hours = absolute // 3600
 
@@ -607,6 +281,397 @@ jobs:
 
 
           # ==========================================================
+          # GITHUB API
+          # ==========================================================
+
+          def api(
+              method,
+              endpoint,
+              payload=None,
+              mutation=False
+          ):
+
+              url = API_BASE + endpoint
+
+              for attempt in range(
+                  1,
+                  MAX_RETRIES + 1
+              ):
+
+                  command = [
+                      "curl",
+                      "-sS",
+                      "-L",
+                      "-X",
+                      method,
+                      *HEADERS,
+                      "-w",
+                      "\n__STATUS__:%{http_code}\n"
+                  ]
+
+                  if payload is not None:
+
+                      command.extend([
+                          "-H",
+                          "Content-Type: application/json",
+                          "--data",
+                          json.dumps(
+                              payload,
+                              separators=(
+                                  ",",
+                                  ":"
+                              )
+                          )
+                      ])
+
+                  command.append(url)
+
+                  result = subprocess.run(
+                      command,
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.PIPE,
+                      text=True
+                  )
+
+                  if result.returncode != 0:
+
+                      if attempt == MAX_RETRIES:
+
+                          raise RuntimeError(
+                              "curl failed:\n"
+                              + result.stderr
+                          )
+
+                      wait = min(
+                          120,
+                          5 * (2 ** (attempt - 1))
+                      )
+
+                      print(
+                          f"curl error. "
+                          f"Waiting {wait}s..."
+                      )
+
+                      time.sleep(wait)
+
+                      continue
+
+                  output = result.stdout
+
+                  marker = "\n__STATUS__:"
+
+                  if marker not in output:
+
+                      if attempt == MAX_RETRIES:
+
+                          raise RuntimeError(
+                              "Invalid GitHub response:\n"
+                              + output
+                          )
+
+                      time.sleep(
+                          min(
+                              120,
+                              5 * (2 ** (attempt - 1))
+                          )
+                      )
+
+                      continue
+
+                  body, status_text = output.rsplit(
+                      marker,
+                      1
+                  )
+
+                  status = int(
+                      status_text.strip()
+                  )
+
+                  try:
+
+                      data = (
+                          json.loads(body)
+                          if body.strip()
+                          else {}
+                      )
+
+                  except Exception:
+
+                      data = {
+                          "raw": body
+                      }
+
+                  # --------------------------------------------------
+                  # SUCCESS
+                  # --------------------------------------------------
+
+                  if 200 <= status < 300:
+
+                      if mutation:
+
+                          time.sleep(
+                              WRITE_DELAY
+                          )
+
+                      return data
+
+                  message = ""
+
+                  if isinstance(
+                      data,
+                      dict
+                  ):
+
+                      message = str(
+                          data.get(
+                              "message",
+                              ""
+                          )
+                      )
+
+                  # --------------------------------------------------
+                  # RETRYABLE
+                  # --------------------------------------------------
+
+                  retryable = status in (
+                      403,
+                      409,
+                      422,
+                      429,
+                      500,
+                      502,
+                      503,
+                      504
+                  )
+
+                  if retryable:
+
+                      if attempt == MAX_RETRIES:
+
+                          raise RuntimeError(
+                              "\n"
+                              "GitHub API failed.\n"
+                              f"HTTP: {status}\n"
+                              f"Endpoint: {endpoint}\n"
+                              f"Message: {message}\n"
+                              f"Response:\n"
+                              f"{json.dumps(data, indent=2)}"
+                          )
+
+                      # GitHub recommends at least one minute
+                      # for secondary-limit failures when no
+                      # Retry-After is supplied.
+                      if status in (
+                          403,
+                          429
+                      ):
+
+                          wait = max(
+                              60,
+                              10 * (
+                                  2 ** (
+                                      attempt - 1
+                                  )
+                              )
+                          )
+
+                      else:
+
+                          wait = min(
+                              120,
+                              10 * (
+                                  2 ** (
+                                      attempt - 1
+                                  )
+                              )
+                          )
+
+                      print()
+                      print(
+                          f"GitHub API HTTP {status}"
+                      )
+
+                      print(
+                          f"Message: {message}"
+                      )
+
+                      print(
+                          f"Retry "
+                          f"{attempt}/{MAX_RETRIES} "
+                          f"after {wait}s..."
+                      )
+
+                      time.sleep(
+                          wait
+                      )
+
+                      continue
+
+                  # --------------------------------------------------
+                  # PERMANENT FAILURE
+                  # --------------------------------------------------
+
+                  raise RuntimeError(
+                      "\n"
+                      "GitHub API error.\n"
+                      f"HTTP: {status}\n"
+                      f"Endpoint: {endpoint}\n"
+                      f"Message: {message}\n"
+                      f"Response:\n"
+                      f"{json.dumps(data, indent=2)}"
+                  )
+
+              raise RuntimeError(
+                  "API retry loop terminated."
+              )
+
+
+          # ==========================================================
+          # ANALYZE SOURCE
+          # ==========================================================
+
+          print()
+          print("========================================")
+          print("ANALYZING SOURCE REPOSITORY")
+          print("========================================")
+
+          commits = git(
+              "rev-list",
+              "--all",
+              "--topo-order",
+              "--reverse"
+          ).splitlines()
+
+          commits = [
+              x.strip()
+              for x in commits
+              if x.strip()
+          ]
+
+          objects = git(
+              "rev-list",
+              "--objects",
+              "--all"
+          ).splitlines()
+
+          print(
+              f"Commits : {len(commits)}"
+          )
+
+          print(
+              f"Objects : {len(objects)}"
+          )
+
+
+          # ==========================================================
+          # FIND BLOBS
+          # ==========================================================
+
+          print()
+          print("========================================")
+          print("DISCOVERING BLOBS")
+          print("========================================")
+
+          blobs = []
+
+          for line in objects:
+
+              sha = line.split(
+                  " ",
+                  1
+              )[0]
+
+              try:
+
+                  object_type = git(
+                      "cat-file",
+                      "-t",
+                      sha
+                  ).strip()
+
+              except Exception:
+
+                  continue
+
+              if object_type == "blob":
+
+                  blobs.append(
+                      sha
+                  )
+
+          blobs = list(
+              dict.fromkeys(
+                  blobs
+              )
+          )
+
+          print(
+              f"Blobs found: {len(blobs)}"
+          )
+
+
+          # ==========================================================
+          # UPLOAD BLOBS
+          # ==========================================================
+
+          print()
+          print("========================================")
+          print("UPLOADING BLOBS")
+          print("========================================")
+
+          for index, sha in enumerate(
+              blobs,
+              1
+          ):
+
+              content = git(
+                  "cat-file",
+                  "blob",
+                  sha,
+                  raw=True
+              )
+
+              encoded = base64.b64encode(
+                  content
+              ).decode(
+                  "ascii"
+              )
+
+              print(
+                  f"[{index}/{len(blobs)}] "
+                  f"Blob {sha} "
+                  f"({len(content)} bytes)"
+              )
+
+              response = api(
+                  "POST",
+                  f"/repos/{BACKUP_OWNER}/{BACKUP_REPO}/git/blobs",
+                  {
+                      "content": encoded,
+                      "encoding": "base64"
+                  },
+                  mutation=True
+              )
+
+              remote_sha = response.get(
+                  "sha"
+              )
+
+              if remote_sha != sha:
+
+                  raise RuntimeError(
+                      "\nBLOB SHA MISMATCH\n"
+                      f"Source: {sha}\n"
+                      f"Remote: {remote_sha}"
+                  )
+
+          print()
+          print(
+              "All blobs uploaded successfully."
+          )
+
+
+          # ==========================================================
           # PARSE COMMIT
           # ==========================================================
 
@@ -614,7 +679,7 @@ jobs:
               commit_sha
           ):
 
-              raw = git_command(
+              raw = git(
                   "cat-file",
                   "commit",
                   commit_sha,
@@ -626,16 +691,14 @@ jobs:
 
               if "\n\n" in raw:
 
-                  header_text, message = (
-                      raw.split(
-                          "\n\n",
-                          1
-                      )
+                  header, message = raw.split(
+                      "\n\n",
+                      1
                   )
 
               else:
 
-                  header_text = raw
+                  header = raw
                   message = ""
 
               tree_sha = None
@@ -654,7 +717,7 @@ jobs:
 
               signature_lines = []
 
-              lines = header_text.splitlines()
+              lines = header.splitlines()
 
               i = 0
 
@@ -662,21 +725,25 @@ jobs:
 
                   line = lines[i]
 
-                  if line.startswith("tree "):
+                  if line.startswith(
+                      "tree "
+                  ):
 
                       tree_sha = line[
-                          len("tree "):
+                          5:
                       ].strip()
 
                       i += 1
 
                       continue
 
-                  if line.startswith("parent "):
+                  if line.startswith(
+                      "parent "
+                  ):
 
                       parents.append(
                           line[
-                              len("parent "):
+                              7:
                           ].strip()
                       )
 
@@ -684,10 +751,12 @@ jobs:
 
                       continue
 
-                  if line.startswith("author "):
+                  if line.startswith(
+                      "author "
+                  ):
 
                       value = line[
-                          len("author "):
+                          7:
                       ]
 
                       identity, timestamp, timezone_value = (
@@ -703,7 +772,10 @@ jobs:
                       )
 
                       author_name = name
-                      author_email = email.rstrip(">")
+                      author_email = email.rstrip(
+                          ">"
+                      )
+
                       author_timestamp = timestamp
                       author_timezone = timezone_value
 
@@ -711,10 +783,12 @@ jobs:
 
                       continue
 
-                  if line.startswith("committer "):
+                  if line.startswith(
+                      "committer "
+                  ):
 
                       value = line[
-                          len("committer "):
+                          10:
                       ]
 
                       identity, timestamp, timezone_value = (
@@ -730,7 +804,10 @@ jobs:
                       )
 
                       committer_name = name
-                      committer_email = email.rstrip(">")
+                      committer_email = email.rstrip(
+                          ">"
+                      )
+
                       committer_timestamp = timestamp
                       committer_timezone = timezone_value
 
@@ -739,14 +816,16 @@ jobs:
                       continue
 
                   # ------------------------------------------------
-                  # Signed commit
+                  # PGP SIGNATURE
                   # ------------------------------------------------
 
-                  if line.startswith("gpgsig "):
+                  if line.startswith(
+                      "gpgsig "
+                  ):
 
                       signature_lines.append(
                           line[
-                              len("gpgsig "):
+                              7:
                           ]
                       )
 
@@ -756,7 +835,10 @@ jobs:
 
                           continuation = lines[i]
 
-                          if not continuation.startswith(" "):
+                          if not continuation.startswith(
+                              " "
+                          ):
+
                               break
 
                           signature_lines.append(
@@ -807,9 +889,9 @@ jobs:
                           "\n"
                           "NON-PGP SIGNATURE FOUND\n"
                           f"Commit: {commit_sha}\n"
-                          "\n"
-                          "GitHub's Create Commit API "
-                          "supports PGP signatures."
+                          "Exact REST reconstruction "
+                          "is only implemented for PGP "
+                          "signatures."
                       )
 
               return {
@@ -842,6 +924,39 @@ jobs:
 
 
           # ==========================================================
+          # DISCOVER UNIQUE TREES
+          # ==========================================================
+
+          print()
+          print("========================================")
+          print("DISCOVERING TREES")
+          print("========================================")
+
+          tree_shas = []
+
+          for commit_sha in commits:
+
+              tree_sha = git(
+                  "rev-parse",
+                  f"{commit_sha}^{{tree}}"
+              ).strip()
+
+              tree_shas.append(
+                  tree_sha
+              )
+
+          tree_shas = list(
+              dict.fromkeys(
+                  tree_shas
+              )
+          )
+
+          print(
+              f"Trees found: {len(tree_shas)}"
+          )
+
+
+          # ==========================================================
           # RECREATE TREES
           # ==========================================================
 
@@ -852,27 +967,19 @@ jobs:
 
           tree_map = {}
 
-          for commit_index, commit_sha in enumerate(
-              commits,
+          for index, tree_sha in enumerate(
+              tree_shas,
               1
           ):
 
-              tree_sha = git_command(
-                  "rev-parse",
-                  f"{commit_sha}^{{tree}}"
-              ).strip()
-
-              if tree_sha in tree_map:
-                  continue
-
               print(
-                  f"Tree {len(tree_map) + 1}: "
-                  f"{tree_sha}"
+                  f"[{index}/{len(tree_shas)}] "
+                  f"Tree {tree_sha}"
               )
 
               entries = []
 
-              raw_tree = git_command(
+              raw_tree = git(
                   "ls-tree",
                   "-r",
                   "-z",
@@ -890,19 +997,19 @@ jobs:
                   if not record:
                       continue
 
-                  separator = record.find(
+                  tab = record.find(
                       b"\t"
                   )
 
-                  if separator == -1:
+                  if tab == -1:
                       continue
 
                   left = record[
-                      :separator
+                      :tab
                   ]
 
                   path_bytes = record[
-                      separator + 1:
+                      tab + 1:
                   ]
 
                   path = path_bytes.decode(
@@ -948,36 +1055,35 @@ jobs:
                           "sha": object_sha
                       })
 
-              response = github_api(
+              response = api(
                   "POST",
                   f"/repos/{BACKUP_OWNER}/{BACKUP_REPO}/git/trees",
                   {
                       "tree": entries
-                  }
+                  },
+                  mutation=True
               )
 
-              remote_tree_sha = response.get(
+              remote_tree = response.get(
                   "sha"
               )
 
-              if remote_tree_sha != tree_sha:
+              if remote_tree != tree_sha:
 
                   raise RuntimeError(
                       "\nTREE SHA MISMATCH\n"
-                      f"Source tree : {tree_sha}\n"
-                      f"Remote tree : {remote_tree_sha}\n"
-                      f"Commit      : {commit_sha}\n"
-                      f"Entries     : {len(entries)}"
+                      f"Source: {tree_sha}\n"
+                      f"Remote: {remote_tree}\n"
+                      f"Entries: {len(entries)}"
                   )
 
               tree_map[
                   tree_sha
-              ] = remote_tree_sha
+              ] = remote_tree
 
           print()
           print(
-              f"All trees recreated: "
-              f"{len(tree_map)}"
+              "All trees recreated successfully."
           )
 
 
@@ -1006,18 +1112,7 @@ jobs:
                   source_sha
               )
 
-              source_tree = parsed[
-                  "tree"
-              ]
-
-              if source_tree not in tree_map:
-
-                  raise RuntimeError(
-                      f"Tree {source_tree} "
-                      f"was not recreated."
-                  )
-
-              parent_shas = []
+              parents = []
 
               for parent in parsed[
                   "parents"
@@ -1027,11 +1122,11 @@ jobs:
 
                       raise RuntimeError(
                           f"Parent {parent} "
-                          f"for commit {source_sha} "
-                          f"has not been recreated."
+                          f"was not recreated before "
+                          f"{source_sha}"
                       )
 
-                  parent_shas.append(
+                  parents.append(
                       commit_map[parent]
                   )
 
@@ -1041,10 +1136,10 @@ jobs:
                   ],
 
                   "tree": tree_map[
-                      source_tree
+                      parsed["tree"]
                   ],
 
-                  "parents": parent_shas,
+                  "parents": parents,
 
                   "author": parsed[
                       "author"
@@ -1065,10 +1160,11 @@ jobs:
                       "signature"
                   ]
 
-              response = github_api(
+              response = api(
                   "POST",
                   f"/repos/{BACKUP_OWNER}/{BACKUP_REPO}/git/commits",
-                  payload
+                  payload,
+                  mutation=True
               )
 
               remote_sha = response.get(
@@ -1077,23 +1173,15 @@ jobs:
 
               if remote_sha != source_sha:
 
-                  verification = response.get(
-                      "verification",
-                      {}
-                  )
-
                   raise RuntimeError(
                       "\n"
                       "========================================\n"
                       "COMMIT SHA MISMATCH\n"
                       "========================================\n"
-                      f"Source commit : {source_sha}\n"
-                      f"Remote commit : {remote_sha}\n"
-                      f"Tree          : {source_tree}\n"
-                      f"Signed        : "
+                      f"Source: {source_sha}\n"
+                      f"Remote: {remote_sha}\n"
+                      f"Signed: "
                       f"{parsed['signature'] is not None}\n"
-                      f"Verification  : "
-                      f"{json.dumps(verification)}\n"
                       "========================================"
                   )
 
@@ -1103,8 +1191,7 @@ jobs:
 
           print()
           print(
-              f"All commits recreated: "
-              f"{len(commit_map)}"
+              f"All {len(commit_map)} commits recreated."
           )
 
 
@@ -1117,20 +1204,28 @@ jobs:
           print("RESTORING BRANCHES")
           print("========================================")
 
-          branch_lines = git_command(
+          branches = []
+
+          branch_lines = git(
               "for-each-ref",
-              "--format=%(refname:strip=3)",
+              "--format=%(refname)",
               "refs/remotes/origin"
           ).splitlines()
 
-          branches = []
+          for ref in branch_lines:
 
-          for branch in branch_lines:
+              prefix = (
+                  "refs/remotes/origin/"
+              )
 
-              branch = branch.strip()
-
-              if not branch:
+              if not ref.startswith(
+                  prefix
+              ):
                   continue
+
+              branch = ref[
+                  len(prefix):
+              ]
 
               if branch == "HEAD":
                   continue
@@ -1146,20 +1241,14 @@ jobs:
           )
 
           print(
-              f"Branches found: "
-              f"{len(branches)}"
+              f"Branches: {len(branches)}"
           )
 
           for branch in branches:
 
-              source_ref = (
-                  f"refs/remotes/origin/"
-                  f"{branch}"
-              )
-
-              source_sha = git_command(
+              source_sha = git(
                   "rev-parse",
-                  source_ref
+                  f"refs/remotes/origin/{branch}"
               ).strip()
 
               remote_sha = commit_map.get(
@@ -1169,8 +1258,8 @@ jobs:
               if remote_sha is None:
 
                   raise RuntimeError(
-                      f"Branch {branch} "
-                      f"points to unknown commit "
+                      f"Could not map branch "
+                      f"{branch} commit "
                       f"{source_sha}"
                   )
 
@@ -1178,13 +1267,14 @@ jobs:
                   f"{branch} -> {source_sha}"
               )
 
-              github_api(
+              api(
                   "POST",
                   f"/repos/{BACKUP_OWNER}/{BACKUP_REPO}/git/refs",
                   {
                       "ref": f"refs/heads/{branch}",
                       "sha": remote_sha
-                  }
+                  },
+                  mutation=True
               )
 
 
@@ -1197,16 +1287,13 @@ jobs:
           print("RESTORING TAGS")
           print("========================================")
 
-          tag_lines = git_command(
+          tag_lines = git(
               "for-each-ref",
               "--format=%(refname)%00%(objectname)%00%(objecttype)",
               "refs/tags"
           ).splitlines()
 
           for line in tag_lines:
-
-              if not line:
-                  continue
 
               parts = line.split(
                   "\x00"
@@ -1215,7 +1302,7 @@ jobs:
               if len(parts) != 3:
                   continue
 
-              full_ref = parts[0]
+              ref_name = parts[0]
 
               object_sha = parts[1]
 
@@ -1223,12 +1310,12 @@ jobs:
 
               prefix = "refs/tags/"
 
-              if not full_ref.startswith(
+              if not ref_name.startswith(
                   prefix
               ):
                   continue
 
-              tag_name = full_ref[
+              tag_name = ref_name[
                   len(prefix):
               ]
 
@@ -1250,13 +1337,14 @@ jobs:
                           target_sha
                       ]
 
-                  github_api(
+                  api(
                       "POST",
                       f"/repos/{BACKUP_OWNER}/{BACKUP_REPO}/git/refs",
                       {
                           "ref": f"refs/tags/{tag_name}",
                           "sha": target_sha
-                      }
+                      },
+                      mutation=True
                   )
 
                   continue
@@ -1265,7 +1353,7 @@ jobs:
               # ANNOTATED TAG
               # ------------------------------------------------------
 
-              raw_tag = git_command(
+              raw_tag = git(
                   "cat-file",
                   "tag",
                   object_sha,
@@ -1296,29 +1384,23 @@ jobs:
               tagger_timestamp = None
               tagger_timezone = None
 
-              for header_line in (
-                  tag_header.splitlines()
-              ):
+              for line2 in tag_header.splitlines():
 
-                  if header_line.startswith(
+                  if line2.startswith(
                       "object "
                   ):
 
-                      target_sha = (
-                          header_line[
-                              len("object "):
-                          ].strip()
-                      )
+                      target_sha = line2[
+                          7:
+                      ].strip()
 
-                  elif header_line.startswith(
+                  elif line2.startswith(
                       "tagger "
                   ):
 
-                      value = (
-                          header_line[
-                              len("tagger "):
-                          ]
-                      )
+                      value = line2[
+                          7:
+                      ]
 
                       identity, timestamp, timezone_value = (
                           value.rsplit(
@@ -1334,17 +1416,13 @@ jobs:
 
                       tagger_name = name
 
-                      tagger_email = (
-                          email.rstrip(">")
+                      tagger_email = email.rstrip(
+                          ">"
                       )
 
-                      tagger_timestamp = (
-                          timestamp
-                      )
+                      tagger_timestamp = timestamp
 
-                      tagger_timezone = (
-                          timezone_value
-                      )
+                      tagger_timezone = timezone_value
 
               # ------------------------------------------------------
               # SIGNED ANNOTATED TAG
@@ -1357,25 +1435,21 @@ jobs:
 
                   raise RuntimeError(
                       "\n"
-                      "========================================\n"
                       "SIGNED ANNOTATED TAG DETECTED\n"
-                      "========================================\n"
                       f"Tag: {tag_name}\n"
-                      f"Object: {object_sha}\n"
                       "\n"
-                      "GitHub's Create Tag Object API does not "
-                      "provide a signature field for signed "
-                      "annotated tags.\n"
+                      "GitHub's REST Tag API cannot accept "
+                      "a PGP signature for a newly-created "
+                      "annotated tag.\n"
                       "\n"
-                      "The workflow stopped instead of silently "
-                      "changing the signed tag.\n"
-                      "========================================"
+                      "Stopping instead of silently "
+                      "changing the tag.\n"
                   )
 
               if target_sha is None:
 
                   raise RuntimeError(
-                      f"Annotated tag {tag_name} "
+                      f"Tag {tag_name} "
                       "has no target object."
                   )
 
@@ -1402,7 +1476,7 @@ jobs:
                   tagger_timezone
               )
 
-              response = github_api(
+              response = api(
                   "POST",
                   f"/repos/{BACKUP_OWNER}/{BACKUP_REPO}/git/tags",
                   {
@@ -1415,7 +1489,8 @@ jobs:
                           "email": tagger_email,
                           "date": tagger_date
                       }
-                  }
+                  },
+                  mutation=True
               )
 
               tag_object_sha = response.get(
@@ -1425,18 +1500,18 @@ jobs:
               if not tag_object_sha:
 
                   raise RuntimeError(
-                      f"GitHub did not return "
-                      f"a tag object SHA for "
-                      f"{tag_name}"
+                      f"No tag object SHA "
+                      f"returned for {tag_name}"
                   )
 
-              github_api(
+              api(
                   "POST",
                   f"/repos/{BACKUP_OWNER}/{BACKUP_REPO}/git/refs",
                   {
                       "ref": f"refs/tags/{tag_name}",
                       "sha": tag_object_sha
-                  }
+                  },
+                  mutation=True
               )
 
 
@@ -1446,18 +1521,18 @@ jobs:
 
           print()
           print("========================================")
-          print("VERIFYING BACKUP")
+          print("VERIFYING MAIN")
           print("========================================")
 
-          source_main = git_command(
+          source_main = git(
               "rev-parse",
               "refs/remotes/origin/main"
           ).strip()
 
-          remote_main_response = github_api(
+          remote_main_response = api(
               "GET",
-              f"/repos/{BACKUP_OWNER}/{BACKUP_REPO}/git/ref/heads/main",
-              write=False
+              f"/repos/{BACKUP_OWNER}/{BACKUP_REPO}"
+              f"/git/ref/heads/main"
           )
 
           remote_main = (
@@ -1469,19 +1544,17 @@ jobs:
           )
 
           print(
-              f"Source main : {source_main}"
+              f"Source main: {source_main}"
           )
 
           print(
-              f"Backup main : {remote_main}"
+              f"Backup main: {remote_main}"
           )
 
           if remote_main != source_main:
 
               raise RuntimeError(
-                  "\nMAIN BRANCH SHA VERIFICATION FAILED\n"
-                  f"Source: {source_main}\n"
-                  f"Backup: {remote_main}"
+                  "MAIN SHA VERIFICATION FAILED"
               )
 
 
@@ -1489,26 +1562,30 @@ jobs:
           # VERIFY BRANCHES
           # ==========================================================
 
+          print()
+          print("========================================")
+          print("VERIFYING BRANCHES")
+          print("========================================")
+
           remote_branches = []
 
           page = 1
 
           while True:
 
-              response = github_api(
+              response = api(
                   "GET",
                   f"/repos/{BACKUP_OWNER}/{BACKUP_REPO}"
-                  f"/branches?per_page=100&page={page}",
-                  write=False
+                  f"/branches?per_page=100&page={page}"
               )
 
               if not response:
                   break
 
-              for item in response:
+              for branch in response:
 
                   remote_branches.append(
-                      item["name"]
+                      branch["name"]
                   )
 
               if len(response) < 100:
@@ -1516,27 +1593,22 @@ jobs:
 
               page += 1
 
-          source_branch_set = set(
+          source_set = set(
               branches
           )
 
-          backup_branch_set = set(
+          remote_set = set(
               remote_branches
           )
 
-          if (
-              source_branch_set
-              != backup_branch_set
-          ):
+          if source_set != remote_set:
 
               missing = sorted(
-                  source_branch_set
-                  - backup_branch_set
+                  source_set - remote_set
               )
 
               extra = sorted(
-                  backup_branch_set
-                  - source_branch_set
+                  remote_set - source_set
               )
 
               raise RuntimeError(
@@ -1547,7 +1619,7 @@ jobs:
 
 
           # ==========================================================
-          # SUCCESS
+          # FINAL SUCCESS
           # ==========================================================
 
           print()
@@ -1556,36 +1628,33 @@ jobs:
           print("========================================")
 
           print(
-              f"Source repository : "
+              f"Source : "
               f"{SOURCE_OWNER}/{SOURCE_REPO}"
           )
 
           print(
-              f"Backup repository : "
+              f"Backup : "
               f"{BACKUP_OWNER}/{BACKUP_REPO}"
           )
 
           print(
-              f"Commits backed up : "
-              f"{len(commit_map)}"
+              f"Commits : {len(commit_map)}"
           )
 
           print(
-              f"Trees backed up   : "
-              f"{len(tree_map)}"
+              f"Trees   : {len(tree_map)}"
           )
 
           print(
-              f"Blobs backed up   : "
-              f"{len(blobs)}"
+              f"Blobs   : {len(blobs)}"
           )
 
           print(
-              f"Branches restored : "
-              f"{len(branches)}"
+              f"Branches: {len(branches)}"
           )
 
           print()
+
           print(
               f"https://github.com/"
               f"{BACKUP_OWNER}/"
@@ -1599,17 +1668,20 @@ jobs:
           PYTHON
 
       # ============================================================
-      # FINAL SUMMARY
+      # SUCCESS SUMMARY
       # ============================================================
 
       - name: Backup summary
         if: success()
         shell: bash
         run: |
+          echo
           echo "========================================"
-          echo "PRIVATE BACKUP SUCCESSFUL"
+          echo "PRIVATE GIT BACKUP SUCCESSFUL"
           echo "========================================"
-          echo "Source : HARSHITC0DER/java"
-          echo "Backup : ARJUNC0DER/${BACKUP_REPO}"
-          echo "URL    : https://github.com/ARJUNC0DER/${BACKUP_REPO}"
+          echo "Source:"
+          echo "  https://github.com/HARSHITC0DER/java"
+          echo
+          echo "Backup:"
+          echo "  https://github.com/ARJUNC0DER/${BACKUP_REPO}"
           echo "========================================"
