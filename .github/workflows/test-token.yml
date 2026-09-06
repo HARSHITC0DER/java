@@ -1,4 +1,4 @@
-name: Test Create And Push
+name: Test API Write
 
 on:
   workflow_dispatch:
@@ -8,13 +8,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-          fetch-tags: true
-
-      - name: Create test repository and push
+      - name: Test API write
         env:
           GH_TOKEN: ${{ secrets.BACKUP_TOKEN }}
         run: |
@@ -22,24 +16,28 @@ jobs:
 
           OWNER="ARJUNC0DER"
           TIMESTAMP=$(date -u +"%Y%m%d-%H%M%S")
-          TEST_REPO="git-push-test-${TIMESTAMP}"
+          REPO="api-write-test-${TIMESTAMP}"
 
-          echo "Creating: ${OWNER}/${TEST_REPO}"
+          echo "Creating repository..."
 
-          gh repo create "${OWNER}/${TEST_REPO}" \
-            --private \
-            --description "Temporary Git push authentication test"
+          gh repo create "$OWNER/$REPO" \
+            --private
 
           echo "Repository created."
 
-          echo "Testing Git push..."
+          echo "Testing Contents API..."
 
-          git remote add backup \
-            "https://x-access-token:${GH_TOKEN}@github.com/${OWNER}/${TEST_REPO}.git"
+          echo "hello from API test" > test.txt
 
-          git push backup --mirror
+          CONTENT=$(base64 -w 0 test.txt)
 
-          echo "SUCCESS: Repository creation and Git push both work."
+          gh api \
+            --method PUT \
+            "repos/${OWNER}/${REPO}/contents/test.txt" \
+            -f message="Test API write" \
+            -f content="$CONTENT"
 
-          echo "Test repository:"
-          echo "https://github.com/${OWNER}/${TEST_REPO}"
+          echo "SUCCESS: API can write to the repository."
+
+          echo "Repository:"
+          echo "https://github.com/${OWNER}/${REPO}"
