@@ -1,4 +1,4 @@
-name: Test Backup Token
+name: Test Git Push Access
 
 on:
   workflow_dispatch:
@@ -8,25 +8,15 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Test PAT
+      - name: Test Git HTTPS authentication
         env:
           GH_TOKEN: ${{ secrets.BACKUP_TOKEN }}
         run: |
           set -e
 
-          echo "Testing GitHub authentication..."
+          echo "Testing Git access..."
 
-          gh api user \
-            --jq '"Authenticated account: " + .login'
+          git ls-remote \
+            "https://x-access-token:${GH_TOKEN}@github.com/ARJUNC0DER/java-backup-20260826-101339.git"
 
-          echo "Checking ARJUNC0DER repositories..."
-
-          gh api "user/repos?per_page=5" \
-            --jq '.[] | .full_name + " | Private: " + (.private | tostring)'
-
-          echo "Checking source repository..."
-
-          gh api repos/HARSHITC0DER/java \
-            --jq '"Source repository: " + .full_name'
-
-          echo "PAT test completed successfully."
+          echo "Git HTTPS authentication works."
